@@ -118,12 +118,15 @@ _Phases are sequential, not overlapping. New ideas go into “Future Enhancement
         - Text
         - Images
         - Metadata
-
+- At completion of this phase, the website should accept a file, accept user input (i.e. phrase to redact, how to split pages), process whichever function is selected, and return the updated PDF as a download. 
 
 **Phase 2 – Usability Enhancements**  
 - Add user-friendly frontend components (drag-and-drop, progress bar).
     - Manual redaction
+        - View the PDF in a web viewer and drag and drop boxes over areas to be redacted.
+        - Remember, even this redaction must be permanent. 
     - Redaction approval for fuzzy matches
+    - These need to mark up and edit the PDF before the download is available. There should be a finalize button that then prompts a download. 
 - Basic error handling + logging.  
 - Style with consistent UI framework.  
 
