@@ -336,7 +336,9 @@ class TextExtractionService:
                     'pages_with_text': len([p for p in processed_pages if p['has_content']]),
                     'total_text_length': total_text_length,
                     'average_text_per_page': total_text_length / len(processed_pages) if processed_pages else 0,
-                    'extraction_method': 'text_layer'
+                    'average_confidence': 1.0,  # Text layer always has 1.0 confidence (0.0-1.0 scale)
+                    'extraction_method': 'text_layer',
+                    'confidence_scale': '0.0-1.0'  # Document confidence scale used
                 }
             }
             
@@ -465,8 +467,9 @@ class TextExtractionService:
                     'pages_with_text': len([p for p in processed_pages if p['has_content']]),
                     'total_text_length': total_text_length,
                     'average_text_per_page': total_text_length / len(processed_pages) if processed_pages else 0,
-                    'average_confidence': sum(p['extraction_confidence'] for p in processed_pages) / len(processed_pages) if processed_pages else 0,
-                    'extraction_method': 'ocr'
+                    'average_confidence': sum(p['extraction_confidence'] for p in processed_pages) / len(processed_pages) if processed_pages else 0,  # 0.0-1.0 scale
+                    'extraction_method': 'ocr',
+                    'confidence_scale': '0.0-1.0'  # Document confidence scale used
                 }
             }
             
@@ -512,6 +515,9 @@ class TextExtractionService:
                 result = text_result
                 result['extraction_source'] = 'hybrid'
                 result['summary']['extraction_method'] = 'hybrid'
+                # Ensure confidence scale is documented
+                if 'confidence_scale' not in result['summary']:
+                    result['summary']['confidence_scale'] = '0.0-1.0'
                 for page in result['pages']:
                     page['extraction_source'] = 'hybrid'
                     page['processing_metadata']['extraction_method'] = 'hybrid'
@@ -561,6 +567,9 @@ class TextExtractionService:
                 result = text_result
                 result['extraction_source'] = 'hybrid'
                 result['summary']['extraction_method'] = 'hybrid'
+                # Ensure confidence scale is documented
+                if 'confidence_scale' not in result['summary']:
+                    result['summary']['confidence_scale'] = '0.0-1.0'
                 return result
             
             # Process OCR for needed pages
@@ -638,8 +647,10 @@ class TextExtractionService:
                     'pages_with_text': len([p for p in processed_pages if p['has_content']]),
                     'total_text_length': total_text_length,
                     'average_text_per_page': total_text_length / len(processed_pages) if processed_pages else 0,
+                    'average_confidence': sum(p['extraction_confidence'] for p in processed_pages) / len(processed_pages) if processed_pages else 0,  # 0.0-1.0 scale
                     'pages_enhanced_with_ocr': len(ocr_results),
-                    'extraction_method': 'hybrid'
+                    'extraction_method': 'hybrid',
+                    'confidence_scale': '0.0-1.0'  # Document confidence scale used
                 }
             }
             
@@ -692,9 +703,9 @@ class TextExtractionService:
                     'sources_used': ['ocr']
                 }
         
-        # Strategy 2: Use higher confidence if confidence gap is significant
-        confidence_diff = abs(text_layer_confidence - ocr_confidence)
-        if confidence_diff > 30:
+        # Strategy 2: Use higher confidence if confidence gap is significant (0.0-1.0 scale)
+        confidence_difference = abs(text_layer_confidence - ocr_confidence)
+        if confidence_difference > 0.3:
             if text_layer_confidence > ocr_confidence:
                 return {
                     'text': text_layer_text,
@@ -834,51 +845,52 @@ class TextExtractionService:
         text_lengths = [p['text_length'] for p in pages]
         
         confidence_stats = {
-            'min_confidence': min(confidences) if confidences else 0,
-            'max_confidence': max(confidences) if confidences else 0,
-            'average_confidence': sum(confidences) / len(confidences) if confidences else 0,
-            'weighted_confidence': (
+            'min_confidence': min(confidences) if confidences else 0,  # 0.0-1.0 scale
+            'max_confidence': max(confidences) if confidences else 0,  # 0.0-1.0 scale
+            'average_confidence': sum(confidences) / len(confidences) if confidences else 0,  # 0.0-1.0 scale
+            'weighted_confidence': (  # Text-length weighted confidence (0.0-1.0 scale)
                 sum(c * l for c, l in zip(confidences, text_lengths)) /
                 sum(text_lengths) if sum(text_lengths) > 0 else 0
             ),
             'confidence_distribution': self._get_confidence_distribution(confidences),
-            'quality_distribution': self._get_quality_distribution(pages)
+            'quality_distribution': self._get_quality_distribution(pages),
+            'confidence_scale': '0.0-1.0'  # Document confidence scale used throughout
         }
         
         result['confidence_analysis'] = confidence_stats
         return result
     
     def _get_confidence_distribution(self, confidences: List[float]) -> Dict[str, int]:
-        """Get distribution of confidence scores.
+        """Get distribution of confidence scores (0.0-1.0 scale).
         
         Args:
-            confidences: List of confidence scores
+            confidences: List of confidence scores (0.0-1.0)
             
         Returns:
-            Distribution dictionary
+            Distribution dictionary with 0-1 scale bins
         """
         distribution = {
-            '90-100': 0,
-            '80-89': 0,
-            '70-79': 0,
-            '60-69': 0,
-            '50-59': 0,
-            'below-50': 0
+            '0.9-1.0': 0,
+            '0.8-0.89': 0,
+            '0.7-0.79': 0,
+            '0.6-0.69': 0,
+            '0.5-0.59': 0,
+            'below-0.5': 0
         }
         
         for confidence in confidences:
-            if confidence >= 90:
-                distribution['90-100'] += 1
-            elif confidence >= 80:
-                distribution['80-89'] += 1
-            elif confidence >= 70:
-                distribution['70-79'] += 1
-            elif confidence >= 60:
-                distribution['60-69'] += 1
-            elif confidence >= 50:
-                distribution['50-59'] += 1
+            if confidence >= 0.9:
+                distribution['0.9-1.0'] += 1
+            elif confidence >= 0.8:
+                distribution['0.8-0.89'] += 1
+            elif confidence >= 0.7:
+                distribution['0.7-0.79'] += 1
+            elif confidence >= 0.6:
+                distribution['0.6-0.69'] += 1
+            elif confidence >= 0.5:
+                distribution['0.5-0.59'] += 1
             else:
-                distribution['below-50'] += 1
+                distribution['below-0.5'] += 1
         
         return distribution
     

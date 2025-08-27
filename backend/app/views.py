@@ -19,6 +19,10 @@ from .utils.errors import APIError, ERROR_MAPPINGS, ValidationError
 from .services.temp_file_manager import TempFileManager
 from .services.pdf_processor import PDFProcessor
 from .services.ocr_service import OCRService
+from .services.unified_search_service import UnifiedSearchService
+from .services.redaction_service import RedactionService
+from .services.bounding_box_calculator import BoundingBoxCalculator
+from .models import RedactionMatch
 
 logger = logging.getLogger(__name__)
 
@@ -169,14 +173,14 @@ class FileUploadView(APIView):
 
 
 class RedactionAPIView(APIView):
-    """Handle PDF redaction requests with comprehensive processing."""
+    """Handle PDF redaction requests with permanent text deletion."""
     
-    def _estimate_redaction_time(self, file_size: int, search_terms_count: int) -> dict:
+    def _estimate_redaction_time(self, file_size: int, match_count: int) -> dict:
         """Estimate redaction processing time.
         
         Args:
             file_size: File size in bytes
-            search_terms_count: Number of search terms
+            match_count: Number of matches to redact
             
         Returns:
             Dictionary with time estimates
@@ -184,21 +188,24 @@ class RedactionAPIView(APIView):
         # Base time factors
         base_time = 10  # seconds
         size_factor = file_size / (1024 * 1024)  # MB
-        search_factor = search_terms_count * 2  # 2 seconds per search term
+        match_factor = match_count * 0.5  # 0.5 seconds per match
         
-        estimated_seconds = int(base_time + size_factor + search_factor)
+        estimated_seconds = int(base_time + size_factor + match_factor)
         
         return {
             'estimated_seconds': estimated_seconds,
-            'estimated_minutes': round(estimated_seconds / 60, 1)
+            'estimated_minutes': round(estimated_seconds / 60, 1),
+            'requires_background': estimated_seconds > 30
         }
     
     def post(self, request):
-        """Start PDF redaction process."""
+        """Start PDF redaction process with search and permanent text deletion."""
         try:
             document_id = request.data.get('document_id')
             search_terms = request.data.get('search_terms', [])
             fuzzy_threshold = request.data.get('fuzzy_threshold', 80)
+            confidence_threshold = request.data.get('confidence_threshold', 95)
+            redaction_options = request.data.get('redaction_options', {})
             
             if not document_id or not search_terms:
                 raise APIError(
@@ -208,15 +215,6 @@ class RedactionAPIView(APIView):
                 )
             
             document = PDFDocument.objects.get(id=document_id)
-            
-            # Create processing job
-            job = ProcessingJob.objects.create(
-                document=document,
-                job_type='redact'
-            )
-            
-            # Initialize PDF processor and validate document exists
-            pdf_processor = PDFProcessor(document.session_id)
             file_path = TempFileManager.get_session_path(document.session_id, 'uploads') / document.filename
             
             if not file_path.exists():
@@ -226,42 +224,89 @@ class RedactionAPIView(APIView):
                     status.HTTP_404_NOT_FOUND
                 )
             
-            # Validate fuzzy threshold
-            if not (0 <= fuzzy_threshold <= 100):
-                raise APIError(
-                    "Fuzzy threshold must be between 0 and 100",
-                    "INVALID_THRESHOLD",
-                    status.HTTP_400_BAD_REQUEST
-                )
+            # Use UnifiedSearchService to find matches
+            search_service = UnifiedSearchService(document.session_id)
+            search_results = search_service.search_document(
+                str(file_path),
+                search_terms,
+                fuzzy_threshold=fuzzy_threshold
+            )
             
-            # Update job with processing parameters
-            job.processing_parameters = {
-                'search_terms': search_terms,
-                'fuzzy_threshold': fuzzy_threshold,
-                'document_path': str(file_path)
-            }
-            job.save()
+            # Filter matches by confidence for automatic approval
+            high_confidence_matches = []
+            low_confidence_matches = []
             
-            # Queue background task for processing
-            try:
-                from tasks import process_pdf_redaction
-                process_pdf_redaction.delay(str(document.id), str(job.id), search_terms, fuzzy_threshold)
-                job.status = 'queued'
-                job.save()
-            except ImportError:
-                logger.warning("Celery not available, processing will be synchronous")
-                job.status = 'pending'
-                job.save()
+            for match in search_results.get('matches', []):
+                if match.confidence_score >= confidence_threshold:
+                    high_confidence_matches.append(match)
+                else:
+                    low_confidence_matches.append(match)
+            
+            # If there are low confidence matches, return them for approval
+            if low_confidence_matches and not request.data.get('approve_all', False):
+                return Response({
+                    'success': True,
+                    'requires_approval': True,
+                    'high_confidence_matches': len(high_confidence_matches),
+                    'low_confidence_matches': [
+                        {
+                            'id': str(m.id),
+                            'matched_text': m.matched_text,
+                            'page_number': m.page_number,
+                            'confidence_score': m.confidence_score,
+                            'search_term': m.search_term
+                        } for m in low_confidence_matches
+                    ],
+                    'message': f'Found {len(low_confidence_matches)} matches below {confidence_threshold}% confidence requiring approval'
+                })
+            
+            # All matches approved or high confidence - proceed with redaction
+            all_matches = high_confidence_matches + low_confidence_matches
+            
+            # Create processing job
+            job = ProcessingJob.objects.create(
+                document=document,
+                job_type='redact',
+                processing_parameters={
+                    'search_terms': search_terms,
+                    'match_count': len(all_matches),
+                    'confidence_threshold': confidence_threshold,
+                    'redaction_options': redaction_options
+                }
+            )
+            
+            # Check if background processing is needed
+            estimated_time = self._estimate_redaction_time(document.file_size, len(all_matches))
+            
+            if estimated_time['requires_background']:
+                # Queue background task for processing
+                try:
+                    from tasks import apply_text_redactions
+                    apply_text_redactions.delay(
+                        str(job.id),
+                        str(file_path),
+                        [m.id for m in all_matches],
+                        redaction_options
+                    )
+                    job.status = 'queued'
+                    job.save()
+                except ImportError:
+                    logger.warning("Celery not available, processing synchronously")
+                    self._process_redaction_sync(job, file_path, all_matches, redaction_options)
+            else:
+                # Process immediately for small files
+                self._process_redaction_sync(job, file_path, all_matches, redaction_options)
             
             return Response({
                 'success': True,
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': 'Redaction job queued for processing',
-                'parameters': {
-                    'search_terms_count': len(search_terms),
-                    'fuzzy_threshold': fuzzy_threshold,
-                    'estimated_processing_time': self._estimate_redaction_time(document.file_size, len(search_terms))
+                'message': 'Redaction job initiated with permanent text deletion',
+                'statistics': {
+                    'total_matches': len(all_matches),
+                    'high_confidence_matches': len(high_confidence_matches),
+                    'pages_affected': len(set(m.page_number for m in all_matches)),
+                    'estimated_processing_time': estimated_time
                 }
             })
             
@@ -274,6 +319,191 @@ class RedactionAPIView(APIView):
             return Response(e.to_dict(), status=e.status)
         except Exception as e:
             logger.error(f"Redaction error: {str(e)}")
+            return Response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+    
+    def _process_redaction_sync(self, job, file_path, matches, options):
+        """Process redaction synchronously for small files."""
+        try:
+            job.status = 'processing'
+            job.save()
+            
+            # Initialize RedactionService
+            redaction_service = RedactionService(job.document.session_id)
+            
+            # Apply permanent text redactions
+            result = redaction_service.redact_pdf(
+                file_path,
+                matches,
+                **options
+            )
+            
+            if result['success']:
+                job.status = 'completed'
+                job.results = result
+                job.progress = 100
+            else:
+                job.status = 'failed'
+                job.error_messages = result.get('errors', ['Unknown error'])
+            
+            job.save()
+            
+        except Exception as e:
+            logger.error(f"Synchronous redaction failed: {str(e)}")
+            job.status = 'failed'
+            job.error_messages = [str(e)]
+            job.save()
+
+
+class RedactionApprovalView(APIView):
+    """Handle approval of low-confidence redaction matches."""
+    
+    def post(self, request):
+        """Approve or reject low-confidence matches and continue redaction."""
+        try:
+            document_id = request.data.get('document_id')
+            approved_match_ids = request.data.get('approved_match_ids', [])
+            rejected_match_ids = request.data.get('rejected_match_ids', [])
+            redaction_options = request.data.get('redaction_options', {})
+            
+            if not document_id:
+                raise APIError(
+                    "Document ID is required",
+                    "MISSING_PARAMETERS",
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            document = PDFDocument.objects.get(id=document_id)
+            file_path = TempFileManager.get_session_path(document.session_id, 'uploads') / document.filename
+            
+            # Get approved matches
+            approved_matches = RedactionMatch.objects.filter(
+                id__in=approved_match_ids,
+                document=document
+            )
+            
+            if not approved_matches:
+                raise APIError(
+                    "No matches approved for redaction",
+                    "NO_MATCHES",
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create processing job
+            job = ProcessingJob.objects.create(
+                document=document,
+                job_type='redact',
+                processing_parameters={
+                    'approved_count': len(approved_match_ids),
+                    'rejected_count': len(rejected_match_ids),
+                    'redaction_options': redaction_options
+                }
+            )
+            
+            # Initialize RedactionService
+            redaction_service = RedactionService(document.session_id)
+            
+            # Apply permanent text redactions
+            result = redaction_service.redact_pdf(
+                file_path,
+                list(approved_matches),
+                **redaction_options
+            )
+            
+            if result['success']:
+                job.status = 'completed'
+                job.results = result
+                job.progress = 100
+            else:
+                job.status = 'failed'
+                job.error_messages = result.get('errors', ['Unknown error'])
+            
+            job.save()
+            
+            return Response({
+                'success': result['success'],
+                'job_id': str(job.id),
+                'output_path': result.get('output_path'),
+                'statistics': result.get('statistics'),
+                'message': 'Redaction completed with permanent text deletion'
+            })
+            
+        except PDFDocument.DoesNotExist:
+            return Response(
+                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'].to_dict(),
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Redaction approval error: {str(e)}")
+            return Response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class RedactionPreviewView(APIView):
+    """Generate redaction preview without permanent deletion."""
+    
+    def post(self, request):
+        """Generate preview of redaction areas."""
+        try:
+            document_id = request.data.get('document_id')
+            match_ids = request.data.get('match_ids', [])
+            
+            if not document_id:
+                raise APIError(
+                    "Document ID is required",
+                    "MISSING_PARAMETERS",
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            document = PDFDocument.objects.get(id=document_id)
+            
+            # Get matches
+            matches = RedactionMatch.objects.filter(
+                id__in=match_ids,
+                document=document
+            )
+            
+            # Initialize BoundingBoxCalculator for coordinate validation
+            bbox_calculator = BoundingBoxCalculator()
+            
+            # Prepare preview data
+            preview_data = []
+            for match in matches:
+                # Ensure coordinates exist
+                if all([
+                    match.x_coordinate is not None,
+                    match.y_coordinate is not None,
+                    match.width is not None,
+                    match.height is not None
+                ]):
+                    preview_data.append({
+                        'page_number': match.page_number,
+                        'x': match.x_coordinate,
+                        'y': match.y_coordinate,
+                        'width': match.width,
+                        'height': match.height,
+                        'text': match.matched_text,
+                        'confidence': match.confidence_score
+                    })
+            
+            return Response({
+                'success': True,
+                'preview_data': preview_data,
+                'total_redactions': len(preview_data),
+                'pages_affected': len(set(m['page_number'] for m in preview_data))
+            })
+            
+        except PDFDocument.DoesNotExist:
+            return Response(
+                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'].to_dict(),
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Exception as e:
+            logger.error(f"Preview generation error: {str(e)}")
             return Response(
                 ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR

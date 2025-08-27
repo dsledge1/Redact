@@ -15,6 +15,7 @@ from app.services.temp_file_manager import TempFileManager
 from app.services.pdf_processor import PDFProcessor
 from app.services.ocr_service import OCRService
 from app.services.fuzzy_matcher import FuzzyMatcher
+from app.services.redaction_service import RedactionService
 from app.models import ProcessingJob, PDFDocument, RedactionMatch
 
 logger = logging.getLogger(__name__)
@@ -797,6 +798,125 @@ def process_ocr_batch(self, document_id: str, job_id: str) -> Dict[str, Any]:
         
         return {
             'success': False,
+            'error': str(exc),
+            'retries': self.request.retries
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=300)
+def apply_text_redactions(
+    self,
+    job_id: str,
+    file_path: str,
+    match_ids: List[str],
+    redaction_options: Dict[str, Any] = None
+) -> Dict[str, Any]:
+    """Apply permanent text redactions to PDF in the background.
+    
+    Args:
+        job_id: Processing job UUID
+        file_path: Path to PDF file
+        match_ids: List of RedactionMatch IDs to apply
+        redaction_options: Redaction appearance and behavior options
+        
+    Returns:
+        Dictionary with redaction results
+    """
+    try:
+        # Get the processing job
+        job = ProcessingJob.objects.get(id=job_id)
+        job.status = 'processing'
+        job.progress = 10
+        job.save()
+        
+        logger.info(f"Starting text redaction for job {job_id} with {len(match_ids)} matches")
+        
+        # Get redaction matches
+        matches = RedactionMatch.objects.filter(id__in=match_ids)
+        if not matches:
+            raise ValueError("No valid redaction matches found")
+        
+        job.progress = 20
+        job.save()
+        
+        # Initialize RedactionService
+        redaction_service = RedactionService(job.document.session_id)
+        
+        # Convert file path to Path object
+        pdf_file = Path(file_path)
+        if not pdf_file.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_file}")
+        
+        job.progress = 30
+        job.save()
+        
+        # Apply permanent text redactions
+        logger.info(f"Applying {len(matches)} redactions to {pdf_file.name}")
+        
+        result = redaction_service.redact_pdf(
+            pdf_file,
+            list(matches),
+            **(redaction_options or {})
+        )
+        
+        job.progress = 80
+        job.save()
+        
+        if result['success']:
+            job.status = 'completed'
+            job.progress = 100
+            job.results = result
+            
+            # Update match records to mark as redacted
+            matches.update(redacted=True, redaction_applied_at=timezone.now())
+            
+            logger.info(f"Successfully completed text redaction for job {job_id}")
+            logger.info(f"Output file: {result['output_path']}")
+            logger.info(f"Statistics: {result['statistics']}")
+        else:
+            job.status = 'failed'
+            job.error_messages = result.get('errors', ['Unknown redaction error'])
+            logger.error(f"Text redaction failed for job {job_id}: {job.error_messages}")
+        
+        job.save()
+        
+        # Schedule cleanup after processing
+        TempFileManager.schedule_cleanup(job.document.session_id)
+        
+        return {
+            'success': result['success'],
+            'job_id': job_id,
+            'output_path': result.get('output_path'),
+            'statistics': result.get('statistics'),
+            'errors': result.get('errors', [])
+        }
+        
+    except ProcessingJob.DoesNotExist:
+        logger.error(f"Processing job not found: {job_id}")
+        return {
+            'success': False,
+            'error': f"Job {job_id} not found"
+        }
+        
+    except Exception as exc:
+        logger.error(f"Text redaction task failed for job {job_id}: {str(exc)}")
+        
+        # Update job status
+        try:
+            job = ProcessingJob.objects.get(id=job_id)
+            job.status = 'failed'
+            job.error_messages = str(exc)
+            job.save()
+        except ProcessingJob.DoesNotExist:
+            pass
+        
+        if self.request.retries < self.max_retries:
+            logger.info(f"Retrying redaction task for job {job_id} (attempt {self.request.retries + 1})")
+            raise self.retry(countdown=300 * (2 ** self.request.retries), exc=exc)
+        
+        return {
+            'success': False,
+            'job_id': job_id,
             'error': str(exc),
             'retries': self.request.retries
         }

@@ -1,6 +1,6 @@
 Django==5.2.5
-PyPDF2==3.0.1
-PyMuPDF==1.23.17
+PyPDF2>=3.0.1
+PyMuPDF>=1.23.17
 fuzzywuzzy==0.18.0
 python-Levenshtein[speedup]==0.25.1
 pytesseract==0.3.10
@@ -19,3 +19,4 @@ cryptography==42.0.2
 django-extensions==3.2.3
 gunicorn==21.2.0
 whitenoise==6.6.0
+dataclasses-json==0.6.3

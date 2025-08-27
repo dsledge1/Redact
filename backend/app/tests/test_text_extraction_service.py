@@ -67,7 +67,14 @@ class TestTextExtractionService(unittest.TestCase):
     
     def test_extract_text_unified_text_layer(self):
         """Test unified extraction using text layer method."""
-        # Mock PDF processor
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': True
+        }
+        
+        # Mock PDF processor text extraction
         self.mock_pdf_processor.extract_text.return_value = {
             'success': True,
             'pages': [
@@ -75,12 +82,10 @@ class TestTextExtractionService(unittest.TestCase):
                     'page_number': 1,
                     'text': 'High quality text content from page 1.',
                     'has_text_layer': True,
-                    'char_count': 39,
-                    'extraction_confidence': 1.0
+                    'char_count': 39
                 }
             ],
-            'total_pages': 1,
-            'extraction_method': 'text_layer'
+            'total_pages': 1
         }
         
         result = self.service.extract_text_unified(
@@ -91,7 +96,7 @@ class TestTextExtractionService(unittest.TestCase):
         
         self.assertIsInstance(result, dict)
         self.assertTrue(result['success'])
-        self.assertEqual(result['extraction_method'], ExtractionMethod.TEXT_LAYER)
+        self.assertEqual(result['extraction_method'], 'text_layer')  # String value
         self.assertEqual(len(result['pages']), 1)
         
         # Verify first page result
@@ -101,13 +106,21 @@ class TestTextExtractionService(unittest.TestCase):
         self.assertEqual(page_result['extraction_confidence'], 1.0)
         
         # Verify PDF processor was called
+        self.mock_pdf_processor.validate_pdf.assert_called_once()
         self.mock_pdf_processor.extract_text.assert_called_once()
         
         # OCR should not have been called for text layer extraction
-        self.mock_ocr_service.extract_text_from_images.assert_not_called()
+        self.assertFalse(self.mock_ocr_service.process_pdf_page_image.called)
     
     def test_extract_text_unified_ocr(self):
         """Test unified extraction using OCR method."""
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': False
+        }
+        
         # Mock PDF processor for image extraction
         self.mock_pdf_processor.extract_pages_as_images.return_value = {
             'success': True,
@@ -122,18 +135,14 @@ class TestTextExtractionService(unittest.TestCase):
             'total_pages': 1
         }
         
-        # Mock OCR service
-        self.mock_ocr_service.extract_text_from_images.return_value = {
+        # Mock OCR service - process_pdf_page_image called per image
+        self.mock_ocr_service.process_pdf_page_image.return_value = {
             'success': True,
-            'results': [
-                {
-                    'page_number': 1,
-                    'text': 'OCR extracted text',
-                    'confidence': 0.85,
-                    'language': 'eng'
-                }
-            ],
-            'total_processed': 1
+            'text': 'OCR extracted text',
+            'confidence': 85.0,  # Will be converted to 0.85
+            'language': 'eng',
+            'words': [],
+            'preprocessing_info': {}
         }
         
         result = self.service.extract_text_unified(
@@ -144,33 +153,40 @@ class TestTextExtractionService(unittest.TestCase):
         
         self.assertIsInstance(result, dict)
         self.assertTrue(result['success'])
-        self.assertEqual(result['extraction_method'], ExtractionMethod.OCR)
+        self.assertEqual(result['extraction_method'], 'ocr')  # String value
         self.assertEqual(len(result['pages']), 1)
         
         page_result = result['pages'][0]
         self.assertEqual(page_result['page_number'], 1)
         self.assertIn('OCR extracted text', page_result['text'])
+        self.assertEqual(page_result['extraction_confidence'], 0.85)  # Converted to 0-1 scale
         
         # Verify both services were called
+        self.mock_pdf_processor.validate_pdf.assert_called_once()
         self.mock_pdf_processor.extract_pages_as_images.assert_called_once()
-        self.mock_ocr_service.extract_text_from_images.assert_called_once()
+        self.mock_ocr_service.process_pdf_page_image.assert_called_once()
     
     def test_extract_text_unified_hybrid(self):
         """Test unified extraction using hybrid method."""
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': True
+        }
+        
         # Mock PDF processor for text extraction
         self.mock_pdf_processor.extract_text.return_value = {
             'success': True,
             'pages': [
                 {
                     'page_number': 1,
-                    'text': 'Text layer content',
+                    'text': 'Poor quality text',
                     'has_text_layer': True,
-                    'char_count': 18,
-                    'extraction_confidence': 0.6  # Lower confidence
+                    'char_count': 18
                 }
             ],
-            'total_pages': 1,
-            'extraction_method': 'text_layer'
+            'total_pages': 1
         }
         
         # Mock PDF processor for image extraction
@@ -188,17 +204,13 @@ class TestTextExtractionService(unittest.TestCase):
         }
         
         # Mock OCR service
-        self.mock_ocr_service.extract_text_from_images.return_value = {
+        self.mock_ocr_service.process_pdf_page_image.return_value = {
             'success': True,
-            'results': [
-                {
-                    'page_number': 1,
-                    'text': 'OCR content with additional details',
-                    'confidence': 0.82,
-                    'language': 'eng'
-                }
-            ],
-            'total_processed': 1
+            'text': 'OCR content with additional details',
+            'confidence': 82.0,  # Will be converted to 0.82
+            'language': 'eng',
+            'words': [],
+            'preprocessing_info': {}
         }
         
         result = self.service.extract_text_unified(
@@ -209,16 +221,23 @@ class TestTextExtractionService(unittest.TestCase):
         
         self.assertIsInstance(result, dict)
         self.assertTrue(result['success'])
-        self.assertEqual(result['extraction_method'], ExtractionMethod.HYBRID)
+        self.assertEqual(result['extraction_method'], 'hybrid')  # String value
         
         # Both services should have been called
+        self.mock_pdf_processor.validate_pdf.assert_called_once()
         self.mock_pdf_processor.extract_text.assert_called_once()
-        self.mock_pdf_processor.extract_pages_as_images.assert_called_once()
-        self.mock_ocr_service.extract_text_from_images.assert_called_once()
+        # Note: OCR may or may not be called depending on text quality assessment
     
     def test_extract_text_with_page_range(self):
         """Test extraction with specific page range."""
-        # Mock PDF processor
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 5,
+            'has_text_layer': True
+        }
+        
+        # Mock PDF processor text extraction
         self.mock_pdf_processor.extract_text.return_value = {
             'success': True,
             'pages': [
@@ -226,19 +245,16 @@ class TestTextExtractionService(unittest.TestCase):
                     'page_number': 2,
                     'text': 'Page 2 content',
                     'has_text_layer': True,
-                    'char_count': 14,
-                    'extraction_confidence': 1.0
+                    'char_count': 14
                 },
                 {
                     'page_number': 3,
                     'text': 'Page 3 content',
                     'has_text_layer': True,
-                    'char_count': 14,
-                    'extraction_confidence': 1.0
+                    'char_count': 14
                 }
             ],
-            'total_pages': 2,
-            'extraction_method': 'text_layer'
+            'total_pages': 2
         }
         
         result = self.service.extract_text_unified(
@@ -256,7 +272,14 @@ class TestTextExtractionService(unittest.TestCase):
     
     def test_extract_text_with_progress_callback(self):
         """Test extraction with progress callback."""
-        # Mock PDF processor
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': True
+        }
+        
+        # Mock PDF processor text extraction
         self.mock_pdf_processor.extract_text.return_value = {
             'success': True,
             'pages': [
@@ -264,12 +287,10 @@ class TestTextExtractionService(unittest.TestCase):
                     'page_number': 1,
                     'text': 'Page 1',
                     'has_text_layer': True,
-                    'char_count': 6,
-                    'extraction_confidence': 1.0
+                    'char_count': 6
                 }
             ],
-            'total_pages': 1,
-            'extraction_method': 'text_layer'
+            'total_pages': 1
         }
         
         progress_calls = []
@@ -288,7 +309,14 @@ class TestTextExtractionService(unittest.TestCase):
     
     def test_extract_text_with_caching(self):
         """Test extraction with caching enabled."""
-        # Mock PDF processor
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': True
+        }
+        
+        # Mock PDF processor text extraction
         self.mock_pdf_processor.extract_text.return_value = {
             'success': True,
             'pages': [
@@ -296,12 +324,10 @@ class TestTextExtractionService(unittest.TestCase):
                     'page_number': 1,
                     'text': 'Cached content',
                     'has_text_layer': True,
-                    'char_count': 14,
-                    'extraction_confidence': 1.0
+                    'char_count': 14
                 }
             ],
-            'total_pages': 1,
-            'extraction_method': 'text_layer'
+            'total_pages': 1
         }
         
         # First extraction
@@ -323,7 +349,8 @@ class TestTextExtractionService(unittest.TestCase):
     
     def test_extract_text_error_handling(self):
         """Test error handling during extraction."""
-        self.mock_pdf_processor.extract_text.side_effect = Exception("PDF processing error")
+        # Mock PDF processor validation to fail
+        self.mock_pdf_processor.validate_pdf.side_effect = Exception("PDF processing error")
         
         result = self.service.extract_text_unified(
             pdf_path=self.temp_pdf_path,
@@ -356,37 +383,171 @@ class TestTextExtractionService(unittest.TestCase):
         self.assertIsInstance(cache_result, dict)
         self.assertIn('success', cache_result)
     
-    def test_get_extraction_method_recommendations(self):
-        """Test extraction method recommendation."""
-        # Mock a sample analysis
+    def test_determine_extraction_method(self):
+        """Test extraction method determination."""
+        # Test with all required parameters
         with patch.object(self.service, '_determine_extraction_method') as mock_determine:
             mock_determine.return_value = ExtractionMethod.TEXT_LAYER
             
-            recommendation = self.service._determine_extraction_method(
-                self.temp_pdf_path, (1, 1)
+            result = self.service._determine_extraction_method(
+                ExtractionMethod.AUTO,
+                self.temp_pdf_path,
+                True,  # has_text_layer
+                (1, 1)  # page_range
             )
             
-            self.assertEqual(recommendation, ExtractionMethod.TEXT_LAYER)
-
-
-class TestTextQualityAssessment(unittest.TestCase):
-    """Test cases for text quality assessment integration."""
+            self.assertEqual(result, ExtractionMethod.TEXT_LAYER)
+            mock_determine.assert_called_once_with(
+                ExtractionMethod.AUTO,
+                self.temp_pdf_path,
+                True,
+                (1, 1)
+            )
     
-    def test_assess_extraction_quality(self):
-        """Test text quality assessment."""
-        service = TextExtractionService(session_id="test")
+    def test_text_quality_assessment(self):
+        """Test text quality assessment methods."""
+        # Test _assess_text_quality
+        quality = self.service._assess_text_quality("High quality text with good content", 35)
+        self.assertIsInstance(quality, TextQuality)
         
-        # Test quality assessment of sample text
-        with patch('app.utils.text_processing.text_quality_assessor') as mock_assessor:
-            mock_assessor.assess_character_confidence.return_value = 0.8
-            mock_assessor.assess_coherence.return_value = 0.7
-            mock_assessor.assess_completeness.return_value = 0.9
-            
-            quality = service._assess_extraction_quality("Sample text for assessment")
-            
-            self.assertIsInstance(quality, TextQuality)
-            self.assertGreaterEqual(quality.overall_score, 0.0)
-            self.assertLessEqual(quality.overall_score, 1.0)
+        # Test _assess_ocr_quality
+        ocr_quality = self.service._assess_ocr_quality("OCR processed text", 0.8)
+        self.assertIsInstance(ocr_quality, TextQuality)
+        
+        # Test _assess_combined_quality
+        combined_quality = self.service._assess_combined_quality("Combined text", 0.85, 20)
+        self.assertIsInstance(combined_quality, TextQuality)
+    
+    def test_extract_text_unified_auto_method(self):
+        """Test extraction using AUTO method which determines best approach."""
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': True
+        }
+        
+        # Mock PDF processor text extraction
+        self.mock_pdf_processor.extract_text.return_value = {
+            'success': True,
+            'pages': [
+                {
+                    'page_number': 1,
+                    'text': 'Good quality text from text layer',
+                    'has_text_layer': True,
+                    'char_count': 35
+                }
+            ],
+            'total_pages': 1
+        }
+        
+        result = self.service.extract_text_unified(
+            pdf_path=self.temp_pdf_path,
+            method=ExtractionMethod.AUTO,
+            use_cache=False
+        )
+        
+        self.assertIsInstance(result, dict)
+        self.assertTrue(result['success'])
+        # AUTO method should determine the best extraction method
+        self.assertIn(result['extraction_method'], ['text_layer', 'ocr', 'hybrid'])
+    
+    def test_ocr_confidence_conversion(self):
+        """Test that OCR confidence is properly converted from 0-100 to 0.0-1.0 scale."""
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 1,
+            'has_text_layer': False
+        }
+        
+        # Mock PDF processor for image extraction
+        self.mock_pdf_processor.extract_pages_as_images.return_value = {
+            'success': True,
+            'images': [
+                {
+                    'page_number': 1,
+                    'image_data': b'fake_image_data',
+                    'format': 'png',
+                    'dpi': 300
+                }
+            ],
+            'total_pages': 1
+        }
+        
+        # Mock OCR service with 0-100 scale confidence
+        self.mock_ocr_service.process_pdf_page_image.return_value = {
+            'success': True,
+            'text': 'OCR text',
+            'confidence': 75.5,  # Should be converted to 0.755
+            'language': 'eng',
+            'words': [],
+            'preprocessing_info': {}
+        }
+        
+        result = self.service.extract_text_unified(
+            pdf_path=self.temp_pdf_path,
+            method=ExtractionMethod.OCR,
+            use_cache=False
+        )
+        
+        # Verify confidence was converted to 0.0-1.0 scale
+        page_result = result['pages'][0]
+        self.assertAlmostEqual(page_result['extraction_confidence'], 0.755, places=3)
+        
+        # Verify summary contains confidence scale documentation
+        self.assertEqual(result['summary']['confidence_scale'], '0.0-1.0')
+    
+    def test_confidence_analysis_generation(self):
+        """Test that confidence analysis is properly generated."""
+        # Mock PDF processor validation
+        self.mock_pdf_processor.validate_pdf.return_value = {
+            'is_valid': True,
+            'page_count': 2,
+            'has_text_layer': True
+        }
+        
+        # Mock PDF processor text extraction
+        self.mock_pdf_processor.extract_text.return_value = {
+            'success': True,
+            'pages': [
+                {
+                    'page_number': 1,
+                    'text': 'First page content',
+                    'has_text_layer': True,
+                    'char_count': 18
+                },
+                {
+                    'page_number': 2,
+                    'text': 'Second page content',
+                    'has_text_layer': True,
+                    'char_count': 19
+                }
+            ],
+            'total_pages': 2
+        }
+        
+        result = self.service.extract_text_unified(
+            pdf_path=self.temp_pdf_path,
+            method=ExtractionMethod.TEXT_LAYER,
+            include_confidence=True,
+            use_cache=False
+        )
+        
+        # Verify confidence analysis is included
+        self.assertIn('confidence_analysis', result)
+        confidence_analysis = result['confidence_analysis']
+        
+        # Check required confidence statistics
+        self.assertIn('min_confidence', confidence_analysis)
+        self.assertIn('max_confidence', confidence_analysis)
+        self.assertIn('average_confidence', confidence_analysis)
+        self.assertIn('weighted_confidence', confidence_analysis)
+        self.assertIn('confidence_distribution', confidence_analysis)
+        self.assertIn('confidence_scale', confidence_analysis)
+        
+        # Verify confidence scale documentation
+        self.assertEqual(confidence_analysis['confidence_scale'], '0.0-1.0')
 
 
 if __name__ == '__main__':

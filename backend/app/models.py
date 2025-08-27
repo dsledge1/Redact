@@ -278,7 +278,8 @@ class RedactionMatch(models.Model):
         ('hybrid', 'Hybrid Source'),
     ]
     
-    job = models.ForeignKey(ProcessingJob, on_delete=models.CASCADE, related_name='matches')
+    job = models.ForeignKey(ProcessingJob, on_delete=models.CASCADE, related_name='matches', null=True, blank=True)
+    document = models.ForeignKey(PDFDocument, on_delete=models.CASCADE, related_name='redaction_matches', null=True, blank=True)
     search_term = models.CharField(max_length=500, help_text="Original search term")
     matched_text = models.TextField(help_text="Matched text from PDF")
     confidence_score = models.FloatField(
@@ -291,10 +292,10 @@ class RedactionMatch(models.Model):
     pattern_type = models.CharField(max_length=50, blank=True, help_text="Pattern type for pattern matches")
     
     # Position information
-    x_coordinate = models.FloatField(help_text="X coordinate of match on page")
-    y_coordinate = models.FloatField(help_text="Y coordinate of match on page")
-    width = models.FloatField(help_text="Width of matched text area")
-    height = models.FloatField(help_text="Height of matched text area")
+    x_coordinate = models.FloatField(null=True, blank=True, help_text="X coordinate of match on page")
+    y_coordinate = models.FloatField(null=True, blank=True, help_text="Y coordinate of match on page")
+    width = models.FloatField(null=True, blank=True, help_text="Width of matched text area")
+    height = models.FloatField(null=True, blank=True, help_text="Height of matched text area")
     
     # Approval workflow
     approved_status = models.BooleanField(
@@ -302,6 +303,10 @@ class RedactionMatch(models.Model):
         blank=True, 
         help_text="True=approved, False=rejected, None=pending"
     )
+    
+    # Redaction tracking
+    redacted = models.BooleanField(default=False, help_text="Whether this match has been redacted")
+    redaction_applied_at = models.DateTimeField(null=True, blank=True, help_text="Timestamp when redaction was applied")
     
     # Enhanced metadata
     confidence_breakdown = models.JSONField(
@@ -392,6 +397,178 @@ class OCRResult(models.Model):
     def get_word_count(self) -> int:
         """Get word count of extracted text."""
         return len(self.extracted_text.split())
+
+
+class RedactionJob(ProcessingJob):
+    """Extended model for redaction-specific job tracking."""
+    
+    class Meta:
+        proxy = True
+        verbose_name = 'Redaction Job'
+        verbose_name_plural = 'Redaction Jobs'
+    
+    def save(self, *args, **kwargs):
+        """Ensure job type is set to redact."""
+        self.job_type = 'redact'
+        super().save(*args, **kwargs)
+    
+    def get_redaction_statistics(self) -> dict:
+        """Calculate redaction-specific statistics."""
+        stats = {
+            'total_matches_found': 0,
+            'matches_approved': 0,
+            'matches_rejected': 0,
+            'matches_pending': 0,
+            'pages_affected': set(),
+            'confidence_distribution': {
+                'high': 0,  # >= 0.9
+                'medium': 0,  # 0.7 - 0.9
+                'low': 0  # < 0.7
+            }
+        }
+        
+        for match in self.matches.all():
+            stats['total_matches_found'] += 1
+            stats['pages_affected'].add(match.page_number)
+            
+            # Approval status
+            if match.approved_status is True:
+                stats['matches_approved'] += 1
+            elif match.approved_status is False:
+                stats['matches_rejected'] += 1
+            else:
+                stats['matches_pending'] += 1
+            
+            # Confidence distribution
+            if match.confidence_score >= 0.9:
+                stats['confidence_distribution']['high'] += 1
+            elif match.confidence_score >= 0.7:
+                stats['confidence_distribution']['medium'] += 1
+            else:
+                stats['confidence_distribution']['low'] += 1
+        
+        stats['pages_affected'] = len(stats['pages_affected'])
+        return stats
+    
+    def is_redaction_complete(self) -> bool:
+        """Check if all approved matches have been redacted."""
+        approved_matches = self.matches.filter(approved_status=True)
+        if not approved_matches.exists():
+            return False
+        return approved_matches.filter(redacted=False).count() == 0
+    
+    def get_affected_pages(self) -> List[int]:
+        """Get list of page numbers that will be or have been redacted."""
+        pages = set()
+        for match in self.matches.filter(approved_status=True):
+            pages.add(match.page_number)
+        return sorted(list(pages))
+    
+    @property
+    def search_terms(self) -> List[str]:
+        """Get search terms from processing parameters."""
+        return self.processing_parameters.get('search_terms', [])
+    
+    @property
+    def redaction_options(self) -> dict:
+        """Get redaction options from processing parameters."""
+        return self.processing_parameters.get('redaction_options', {})
+    
+    @property
+    def total_matches_found(self) -> int:
+        """Get total number of matches found."""
+        return self.matches.count()
+    
+    @property
+    def matches_approved(self) -> int:
+        """Get number of approved matches."""
+        return self.matches.filter(approved_status=True).count()
+    
+    @property
+    def matches_rejected(self) -> int:
+        """Get number of rejected matches."""
+        return self.matches.filter(approved_status=False).count()
+    
+    @property
+    def pages_affected(self) -> int:
+        """Get number of pages affected by redaction."""
+        return len(self.get_affected_pages())
+    
+    @property
+    def permanent_deletion_confirmed(self) -> bool:
+        """Check if permanent text deletion has been confirmed."""
+        return self.results.get('permanent_deletion_confirmed', False) if self.results else False
+
+
+class RedactionAuditLog(models.Model):
+    """Model for compliance and security tracking of redaction operations."""
+    
+    ACTION_TYPES = [
+        ('search', 'Search Performed'),
+        ('preview', 'Preview Generated'),
+        ('approve', 'Matches Approved'),
+        ('reject', 'Matches Rejected'),
+        ('redact', 'Redaction Applied'),
+        ('download', 'Redacted File Downloaded'),
+        ('cancel', 'Job Cancelled'),
+        ('verify', 'Redaction Verified'),
+    ]
+    
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    job = models.ForeignKey(ProcessingJob, on_delete=models.CASCADE, related_name='audit_logs')
+    action_type = models.CharField(max_length=20, choices=ACTION_TYPES)
+    user_session = models.CharField(max_length=64, help_text="User session identifier")
+    action_details = models.JSONField(default=dict, help_text="Action-specific metadata")
+    ip_address = models.GenericIPAddressField(null=True, blank=True, help_text="IP address for security auditing")
+    timestamp = models.DateTimeField(default=timezone.now, help_text="Action timestamp")
+    
+    # Additional security tracking
+    user_agent = models.TextField(blank=True, help_text="Browser user agent string")
+    request_metadata = models.JSONField(default=dict, help_text="Additional request metadata")
+    success = models.BooleanField(default=True, help_text="Whether the action succeeded")
+    error_message = models.TextField(blank=True, help_text="Error message if action failed")
+    
+    class Meta:
+        ordering = ['-timestamp']
+        db_table = 'redaction_audit_logs'
+        indexes = [
+            models.Index(fields=['job', 'timestamp']),
+            models.Index(fields=['user_session', 'timestamp']),
+            models.Index(fields=['action_type', 'timestamp']),
+            models.Index(fields=['ip_address']),
+        ]
+    
+    def __str__(self) -> str:
+        return f"{self.action_type} at {self.timestamp} for job {self.job_id}"
+    
+    @classmethod
+    def log_action(cls, job, action_type, user_session, **kwargs):
+        """Convenience method to log an audit action."""
+        return cls.objects.create(
+            job=job,
+            action_type=action_type,
+            user_session=user_session,
+            action_details=kwargs.get('action_details', {}),
+            ip_address=kwargs.get('ip_address'),
+            user_agent=kwargs.get('user_agent', ''),
+            request_metadata=kwargs.get('request_metadata', {}),
+            success=kwargs.get('success', True),
+            error_message=kwargs.get('error_message', '')
+        )
+    
+    def get_action_summary(self) -> str:
+        """Get a human-readable summary of the action."""
+        summaries = {
+            'search': f"Searched for {self.action_details.get('term_count', 0)} terms",
+            'preview': f"Generated preview for {self.action_details.get('match_count', 0)} matches",
+            'approve': f"Approved {self.action_details.get('approved_count', 0)} matches",
+            'reject': f"Rejected {self.action_details.get('rejected_count', 0)} matches",
+            'redact': f"Applied redactions to {self.action_details.get('pages_affected', 0)} pages",
+            'download': f"Downloaded redacted file {self.action_details.get('filename', '')}",
+            'cancel': "Cancelled redaction job",
+            'verify': f"Verified {self.action_details.get('verified_count', 0)} redactions"
+        }
+        return summaries.get(self.action_type, self.action_type)
     
     def clean(self):
         """Validate confidence score is within valid range."""
