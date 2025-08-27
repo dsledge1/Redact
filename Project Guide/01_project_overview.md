@@ -79,7 +79,7 @@
 
 ---
 
-## 7. Technology Decisions
+## 7. Technology Decisions and Specs
 - **Python version:** 3.12 
 - **Django version:** 5.2.5 LTS 
 - **TypeScript strict mode:** Enabled  
@@ -88,6 +88,33 @@
 - **Testing:** pytest (backend), Jest/Vitest (frontend)  
 - **Optical Character Recognition:** Pytesseract, CV2
 - **Business Model:** Subscription AND pay-per-use
+- **PDF Processing Library:** PyPDF2 (?)
+- **Fuzzy Matching Algorithm:** fuzzywuzzy
+
+### OCR Processing Pipeline
+
+**Step 1: Pre-processing**
+- Use PyMuPDF (fitz) to extract pages as images (300 DPI for accuracy/speed balance)
+- Apply CV2 preprocessing:
+  - Grayscale conversion: `cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)`
+  - Noise removal: `cv2.fastNlMeansDenoising()`
+  - Thresholding for better contrast: `cv2.threshold()` with OTSU
+  - Deskew if needed: Check skew angle, rotate if > 0.5 degrees
+
+**Step 2: Text Detection**
+- Run Tesseract with confidence scores: `pytesseract.image_to_data(output_type=Output.DICT)`
+- Store bounding boxes with confidence > 60% (configurable)
+- Fall back to EAST text detection for complex layouts if Tesseract fails
+
+**Step 3: Post-processing**
+- Cache OCR results in Redis/memory with page hash as key
+- Store: text, bounding boxes, confidence scores, page dimensions
+- Format: `{page_num: {text: str, boxes: [...], confidence: float}}`
+
+**Performance Guidelines:**
+- Process pages in parallel (max 4 workers to avoid memory issues)
+- Skip OCR if PDF has extractable text layer (check with PyPDF2 first)
+- Downscale images > 4000px width before OCR
 
 ---
 
@@ -145,7 +172,106 @@ _Phases are sequential, not overlapping. New ideas go into “Future Enhancement
 
 ---
 
-## 10. Future Enhancements (Ideas Parking Lot)
+## 10. Fuzzy Matching Requirements
+
+- User configurable threshold, default to 80%
+- All fuzzy matches below 95% (default, value can be specified by user) should be noted but not fully redacted until the user verifies
+- Handle variations in case and punctuation
+- Err on the side of matching potential typos and misspellings (but not auto-redacting if they are uncertain, flag to user)
+
+Examples: 
+"John R. Adams" should match "John Adams"
+"Jason Payne" should match "Jason Pain"
+"Roberta DeVries" should match "Roberta Devries", "Roberta D.", and "Robert DeVries"
+"I AM AN ANGRY CATERPILLAR!!!!" should match "i am an angry caterpillar"
+
+## 11. File Processing
+
+### Limits
+
+**Size Limits:**
+- Max single file: 100MB (configurable via env var MAX_FILE_SIZE)
+- Max total session storage: 500MB per user
+- Image extraction limited to 10MB per image
+
+**Timeout Strategy:**
+- Frontend upload timeout: 5 minutes
+- Processing timeouts:
+  - Simple operations (split/merge): 30 seconds
+  - OCR per page: 10 seconds
+  - Full document OCR: 5 minutes max
+  - Fuzzy matching search: 2 minutes
+- Use Celery for operations > 30 seconds
+
+**Implementation:**
+```python
+# Django settings.py
+FILE_UPLOAD_MAX_MEMORY_SIZE = 10 * 1024 * 1024  # 10MB in memory
+DATA_UPLOAD_MAX_MEMORY_SIZE = 100 * 1024 * 1024  # 100MB total
+
+# Celery task
+@app.task(time_limit=300, soft_time_limit=280)  # 5 min hard, 4:40 soft
+def process_large_pdf(file_path):
+    # Processing logic
+    ## Temporary File Handling Strategy
+```
+
+### Temporary File Management
+
+/tmp/ultimate_pdf/
+├── uploads/
+│   └── {session_id}/
+│       └── {timestamp}_{random_id}.pdf
+├── processing/
+│   └── {session_id}/
+│       ├── original.pdf
+│       ├── pages/
+│       │   ├── page_001.png
+│       │   └── page_002.png
+│       └── ocr_cache.json
+└── downloads/
+└── {session_id}/
+└── {output_id}_final.pdf
+
+**Implementation:**
+```python
+import tempfile
+import hashlib
+from pathlib import Path
+
+class TempFileManager:
+    BASE_DIR = Path(tempfile.gettempdir()) / "ultimate_pdf"
+    
+    @classmethod
+    def get_session_path(cls, session_id: str, subdir: str = "uploads"):
+        path = cls.BASE_DIR / subdir / session_id
+        path.mkdir(parents=True, exist_ok=True)
+        return path
+    
+    @classmethod
+    def cleanup_session(cls, session_id: str):
+        """Called after download or timeout"""
+        session_path = cls.BASE_DIR / session_id
+        if session_path.exists():
+            shutil.rmtree(session_path)
+    
+    @classmethod
+    def schedule_cleanup(cls, session_id: str, delay_hours: int = 8):
+        """Celery task to cleanup after delay"""
+        cleanup_abandoned_files.apply_async(
+            args=[session_id], 
+            countdown=delay_hours * 3600
+        )
+```
+
+### Cleanup Rules
+
+- Delete immediately after successful download (user action)
+- Auto-delete after 8 hours (scheduled task)
+- Delete on session end if no download
+- Monitor disk usage, emergency cleanup if > 80% full
+
+## 12. Future Enhancements (Ideas Parking Lot)
 ⚠️ These are *not* in-scope for current phases but may be revisited.  
 - Integration with Office, Monday, or other document processing suites.  
 - Enterprise accounts with multiple users and storage  

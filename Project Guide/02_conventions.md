@@ -143,6 +143,13 @@ export function Button({ label, onClick }: ButtonProps) {
 - TypeScript: Jest (or Vitest), colocated in __tests__/.
 - All new features require tests.
 - Functional tests to be performed on files added to test_documents/
+- Test real-world scenarios such as:
+  - Corrupted files
+  - Password-protected PDFs
+  - Very large files
+- Performance benchmarking:
+  - Should process 100 page PDF in < 30 seconds
+- Security tests, watching for injections for example
 
 ### Logging
 
@@ -276,3 +283,213 @@ All planned future tasks should be added to the TODO list in Project_Guide/03_to
 - Always use Django's CSRF protection
 - Never log or persist user-uploaded file contents
 - Validate and sanitize all file inputs
+
+## 12. Error Handling
+
+### Error Response Structure
+
+**Backend Error Format:**
+```python
+class APIError(Exception):
+    def __init__(self, message: str, code: str, status: int, details: dict = None):
+        self.message = message
+        self.code = code  # e.g., "PDF_CORRUPT", "OCR_FAILED"
+        self.status = status
+        self.details = details or {}
+
+# Response format
+{
+    "error": {
+        "message": "Unable to process PDF file",  # User-facing
+        "code": "PDF_CORRUPT",                    # For frontend handling
+        "details": {                              # Debug info (dev only)
+            "page": 5,
+            "reason": "Invalid xref table"
+        }
+    },
+    "request_id": "req_abc123"  # For log correlation
+}
+```
+
+### Error Categories & Responses
+
+```
+# Define in errors.py
+ERROR_MAPPINGS = {
+    # File errors
+    "FILE_TOO_LARGE": (413, "File exceeds 100MB limit"),
+    "INVALID_PDF": (400, "File is not a valid PDF"),
+    "PDF_ENCRYPTED": (400, "Password-protected PDFs are not supported"),
+    
+    # Processing errors  
+    "OCR_FAILED": (500, "Unable to read text from image"),
+    "TIMEOUT": (504, "Processing took too long, please try a smaller file"),
+    "FUZZY_MATCH_FAILED": (500, "Text matching encountered an error"),
+    
+    # User errors
+    "NO_MATCHES_FOUND": (404, "No text matching your criteria was found"),
+    "INVALID_REGEX": (400, "The pattern you entered is invalid"),
+}
+```
+
+### Logging Format
+
+```
+import structlog
+
+logger = structlog.get_logger()
+
+# Log with context
+logger.error(
+    "pdf_processing_failed",
+    request_id=request_id,
+    session_id=session_id,
+    error_code="PDF_CORRUPT",
+    file_size=file_size,
+    page_count=page_count,
+    exc_info=True  # Include stack trace
+)
+
+# Output format (JSON for production, pretty for dev):
+{
+    "timestamp": "2025-01-15T10:30:45Z",
+    "level": "error",
+    "event": "pdf_processing_failed",
+    "request_id": "req_abc123",
+    "session_id": "sess_xyz789",
+    "error_code": "PDF_CORRUPT",
+    "file_size": 5242880,
+    "page_count": 42,
+    "exception": "PyPDF2.errors.PdfReadError: Invalid xref table"
+}
+```
+
+## 13. API Structure
+
+/api/redact/ - POST, accepts PDF + redaction params
+/api/split/ - POST, accepts PDF + split instructions
+/api/merge/ - POST, accepts multiple PDFs
+/api/extract/ - POST, accepts PDF + extraction type
+
+## 14. Frontend State Management (Zustand)
+
+```markdown
+### State Management Architecture
+
+**Global State (Zustand) vs Local State (useState)**
+
+**Goes in Global State:**
+- User session/auth info
+- Current PDF document metadata
+- Processing status across pages
+- Redaction settings and matches
+- Error notifications
+
+**Stays in Component State:**
+- Form inputs before submission
+- UI toggles (dropdown open/closed)
+- Temporary hover states
+- Page-specific view settings
+
+**Zustand Store Structure:**
+```typescript
+interface PDFStore {
+  // Document state
+  document: {
+    id: string | null;
+    fileName: string;
+    pageCount: number;
+    fileSize: number;
+    uploadedAt: Date | null;
+  };
+  
+  // Processing state
+  processing: {
+    status: 'idle' | 'uploading' | 'processing' | 'ready' | 'error';
+    progress: number;  // 0-100
+    currentStep: string;  // "Extracting text...", "Running OCR..."
+    errors: Array<{code: string; message: string}>;
+  };
+  
+  // Redaction state
+  redactions: {
+    searchTerms: string[];
+    fuzzyThreshold: number;  // 0.0-1.0
+    matches: Array<{
+      id: string;
+      text: string;
+      page: number;
+      confidence: number;
+      approved: boolean | null;  // null = pending review
+      bounds: {x: number; y: number; w: number; h: number};
+    }>;
+    manualRedactions: Array<{
+      page: number;
+      bounds: {x: number; y: number; w: number; h: number};
+    }>;
+  };
+  
+  // Actions
+  actions: {
+    uploadFile: (file: File) => Promise<void>;
+    approveMatch: (matchId: string) => void;
+    rejectMatch: (matchId: string) => void;
+    addManualRedaction: (page: number, bounds: Bounds) => void;
+    finalizeRedactions: () => Promise<{downloadUrl: string}>;
+    reset: () => void;
+  };
+}
+
+// Create store
+const usePDFStore = create<PDFStore>((set, get) => ({
+  document: { id: null, fileName: '', pageCount: 0, fileSize: 0, uploadedAt: null },
+  processing: { status: 'idle', progress: 0, currentStep: '', errors: [] },
+  redactions: { searchTerms: [], fuzzyThreshold: 0.8, matches: [], manualRedactions: [] },
+  
+  actions: {
+    uploadFile: async (file) => {
+      set({ processing: { status: 'uploading', progress: 0, currentStep: 'Uploading file...', errors: [] }});
+      
+      // Upload logic with progress updates
+      const xhr = new XMLHttpRequest();
+      xhr.upload.onprogress = (e) => {
+        if (e.lengthComputable) {
+          set({ processing: { ...get().processing, progress: (e.loaded / e.total) * 50 }});
+        }
+      };
+      // ... rest of upload
+    },
+    // ... other actions
+  }
+}));
+```
+
+### Upload Progress Handling
+
+```
+// Component using the store
+function UploadProgress() {
+  const { status, progress, currentStep } = usePDFStore(s => s.processing);
+  
+  if (status === 'idle') return null;
+  
+  return (
+    <div className="upload-progress">
+      <div className="progress-bar">
+        <div className="progress-fill" style={{ width: `${progress}%` }} />
+      </div>
+      <p>{currentStep}</p>
+      {status === 'error' && <ErrorDisplay />}
+    </div>
+  );
+}
+
+// Separate concerns: UI state stays local
+function PDFViewer() {
+  const [zoom, setZoom] = useState(1.0);  // Local: view-only
+  const [currentPage, setCurrentPage] = useState(1);  // Local: navigation
+  const matches = usePDFStore(s => s.redactions.matches);  // Global: shared data
+  
+  // ...
+}
+```
