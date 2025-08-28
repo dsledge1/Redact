@@ -14,16 +14,22 @@ from pathlib import Path
 import logging
 import os
 
-from .models import PDFDocument, ProcessingJob
-from .utils.validators import validate_pdf_file, validate_session_id, validate_split_pattern, validate_merge_parameters
-from .utils.errors import APIError, ERROR_MAPPINGS, ValidationError
-from .services.temp_file_manager import TempFileManager
-from .services.pdf_processor import PDFProcessor
-from .services.ocr_service import OCRService
-from .services.unified_search_service import UnifiedSearchService
-from .services.redaction_service import RedactionService
-from .services.bounding_box_calculator import BoundingBoxCalculator
-from .models import RedactionMatch
+from ..models import PDFDocument, ProcessingJob
+from ..utils.validators import validate_pdf_file, validate_session_id, validate_split_pattern, validate_merge_parameters
+from ..utils.errors import APIError, ERROR_MAPPINGS, ValidationError
+from ..utils.response_formatters import APIResponseFormatter
+from ..utils.api_decorators import (
+    log_api_call, timeout_handler, rate_limit, require_session_id, 
+    validate_request_data, handle_file_upload, monitor_performance, require_content_type
+)
+from ..services.temp_file_manager import TempFileManager
+from ..services.pdf_processor import PDFProcessor
+from ..services.ocr_service import OCRService
+from ..services.unified_search_service import UnifiedSearchService
+from ..services.redaction_service import RedactionService
+from ..services.bounding_box_calculator import BoundingBoxCalculator
+from ..models import RedactionMatch
+from ..utils.extraction_utils import validate_extraction_parameters
 
 logger = logging.getLogger(__name__)
 
@@ -56,6 +62,7 @@ class FileUploadView(APIView):
             'size_mb': round(file_size / (1024 * 1024), 2)
         }
     
+    @require_session_id
     def post(self, request):
         """Upload and validate PDF file."""
         try:
@@ -63,10 +70,12 @@ class FileUploadView(APIView):
                 raise APIError("No file provided", "MISSING_FILE", status.HTTP_400_BAD_REQUEST)
             
             uploaded_file = request.FILES['file']
-            session_id = request.data.get('session_id') or TempFileManager.generate_session_id()
+            # Use session ID from decorator validation or generate new one
+            session_id = getattr(request, 'validated_session_id', None) or request.data.get('session_id') or TempFileManager.generate_session_id()
             
-            # Validate session ID before filesystem usage
-            validate_session_id(session_id)
+            # Session ID is already validated by decorator if present
+            if not hasattr(request, 'validated_session_id'):
+                validate_session_id(session_id)
             
             # Validate file
             validate_pdf_file(uploaded_file)
@@ -199,6 +208,13 @@ class RedactionAPIView(APIView):
             'requires_background': estimated_seconds > 30
         }
     
+    @log_api_call()
+    @require_session_id
+    @require_content_type('application/json')
+    @timeout_handler(sync_timeout=30, background_threshold=25)
+    @rate_limit(requests_per_minute=60)
+    @validate_request_data(required_fields=['document_id', 'search_terms'])
+    @monitor_performance
     def post(self, request):
         """Start PDF redaction process with search and permanent text deletion."""
         try:
@@ -245,8 +261,8 @@ class RedactionAPIView(APIView):
             
             # If there are low confidence matches, return them for approval
             if low_confidence_matches and not request.data.get('approve_all', False):
-                return Response({
-                    'success': True,
+                request_id = getattr(request, 'api_request_id', '')
+                approval_data = {
                     'requires_approval': True,
                     'high_confidence_matches': len(high_confidence_matches),
                     'low_confidence_matches': [
@@ -257,9 +273,15 @@ class RedactionAPIView(APIView):
                             'confidence_score': m.confidence_score,
                             'search_term': m.search_term
                         } for m in low_confidence_matches
-                    ],
-                    'message': f'Found {len(low_confidence_matches)} matches below {confidence_threshold}% confidence requiring approval'
-                })
+                    ]
+                }
+                
+                response_data = APIResponseFormatter.format_success_response(
+                    approval_data,
+                    message=f'Found {len(low_confidence_matches)} matches below {confidence_threshold}% confidence requiring approval',
+                    request_id=request_id
+                )
+                return APIResponseFormatter.create_json_response(response_data)
             
             # All matches approved or high confidence - proceed with redaction
             all_matches = high_confidence_matches + low_confidence_matches
@@ -279,8 +301,11 @@ class RedactionAPIView(APIView):
             # Check if background processing is needed
             estimated_time = self._estimate_redaction_time(document.file_size, len(all_matches))
             
-            if estimated_time['requires_background']:
-                # Queue background task for processing
+            # Check for timeout hint from middleware or size-based decision
+            should_queue = getattr(request, 'timeout_hint', False) or estimated_time['requires_background']
+            
+            # Queue background task for processing (consistent with other views)
+            if should_queue:
                 try:
                     from tasks import apply_text_redactions
                     apply_text_redactions.delay(
@@ -292,70 +317,55 @@ class RedactionAPIView(APIView):
                     job.status = 'queued'
                     job.save()
                 except ImportError:
-                    logger.warning("Celery not available, processing synchronously")
-                    self._process_redaction_sync(job, file_path, all_matches, redaction_options)
+                    logger.warning("Celery not available, processing will be synchronous")
+                    job.status = 'pending'
+                    job.save()
+                    should_queue = False  # Reset since we can't queue
             else:
-                # Process immediately for small files
-                self._process_redaction_sync(job, file_path, all_matches, redaction_options)
+                job.status = 'pending'
+                job.save()
             
-            return Response({
-                'success': True,
+            request_id = getattr(request, 'api_request_id', '')
+            redaction_data = {
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': 'Redaction job initiated with permanent text deletion',
-                'statistics': {
+                'redaction_info': {
                     'total_matches': len(all_matches),
                     'high_confidence_matches': len(high_confidence_matches),
                     'pages_affected': len(set(m.page_number for m in all_matches)),
-                    'estimated_processing_time': estimated_time
+                    'estimated_processing_time': estimated_time,
+                    'redaction_options': redaction_options
                 }
-            })
+            }
+            
+            response_data = APIResponseFormatter.format_success_response(
+                redaction_data,
+                message='Redaction job queued for processing',
+                request_id=request_id
+            )
+            
+            # Return 202 for queued background jobs, 200 for pending jobs
+            status_code = 202 if job.status == 'queued' else 200
+            return APIResponseFormatter.create_json_response(response_data, status_code=status_code)
             
         except PDFDocument.DoesNotExist:
-            return Response(
-                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'].to_dict(),
-                status=status.HTTP_404_NOT_FOUND
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_404_NOT_FOUND)
         except APIError as e:
-            return Response(e.to_dict(), status=e.status)
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(e, request_id)
+            return APIResponseFormatter.create_json_response(error_response, e.status)
         except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
             logger.error(f"Redaction error: {str(e)}")
-            return Response(
-                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
     
-    def _process_redaction_sync(self, job, file_path, matches, options):
-        """Process redaction synchronously for small files."""
-        try:
-            job.status = 'processing'
-            job.save()
-            
-            # Initialize RedactionService
-            redaction_service = RedactionService(job.document.session_id)
-            
-            # Apply permanent text redactions
-            result = redaction_service.redact_pdf(
-                file_path,
-                matches,
-                **options
-            )
-            
-            if result['success']:
-                job.status = 'completed'
-                job.results = result
-                job.progress = 100
-            else:
-                job.status = 'failed'
-                job.error_messages = result.get('errors', ['Unknown error'])
-            
-            job.save()
-            
-        except Exception as e:
-            logger.error(f"Synchronous redaction failed: {str(e)}")
-            job.status = 'failed'
-            job.error_messages = [str(e)]
-            job.save()
 
 
 class RedactionApprovalView(APIView):
@@ -423,25 +433,39 @@ class RedactionApprovalView(APIView):
             
             job.save()
             
-            return Response({
-                'success': result['success'],
+            request_id = getattr(request, 'api_request_id', '')
+            approval_data = {
                 'job_id': str(job.id),
+                'status': job.status,
                 'output_path': result.get('output_path'),
-                'statistics': result.get('statistics'),
-                'message': 'Redaction completed with permanent text deletion'
-            })
+                'statistics': result.get('statistics')
+            }
+            
+            response_data = APIResponseFormatter.format_success_response(
+                approval_data,
+                message='Redaction completed with permanent text deletion',
+                request_id=request_id
+            )
+            
+            return APIResponseFormatter.create_json_response(response_data)
             
         except PDFDocument.DoesNotExist:
-            return Response(
-                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'].to_dict(),
-                status=status.HTTP_404_NOT_FOUND
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_404_NOT_FOUND)
+        except APIError as e:
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(e, request_id)
+            return APIResponseFormatter.create_json_response(error_response, e.status)
         except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
             logger.error(f"Redaction approval error: {str(e)}")
-            return Response(
-                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class RedactionPreviewView(APIView):
@@ -532,6 +556,13 @@ class SplitAPIView(APIView):
             'estimated_minutes': round(estimated_seconds / 60, 1)
         }
     
+    @log_api_call()
+    @require_session_id
+    @require_content_type('application/json')
+    @timeout_handler(sync_timeout=30, background_threshold=25) 
+    @rate_limit(requests_per_minute=60)
+    @validate_request_data(required_fields=['document_id'])
+    @monitor_performance
     def post(self, request):
         """Start PDF splitting process with pattern-based or page-based splitting."""
         try:
@@ -684,14 +715,22 @@ class SplitAPIView(APIView):
                 processing_parameters=split_params
             )
             
+            # Check for timeout hint from middleware
+            should_queue = getattr(request, 'timeout_hint', False) or True  # Default to queuing for splits
+            
             # Queue background task for processing
-            try:
-                from tasks import process_pdf_split
-                process_pdf_split.delay(str(document.id), str(job.id), split_params)
-                job.status = 'queued'
-                job.save()
-            except ImportError:
-                logger.warning("Celery not available, processing will be synchronous")
+            if should_queue:
+                try:
+                    from tasks import process_pdf_split
+                    process_pdf_split.delay(str(document.id), str(job.id), split_params)
+                    job.status = 'queued'
+                    job.save()
+                except ImportError:
+                    logger.warning("Celery not available, processing will be synchronous")
+                    job.status = 'pending'
+                    job.save()
+                    should_queue = False  # Reset since we can't queue
+            else:
                 job.status = 'pending'
                 job.save()
             
@@ -700,11 +739,10 @@ class SplitAPIView(APIView):
                 document.file_size, max_page, split_strategy
             )
             
-            response_data = {
-                'success': True,
+            request_id = getattr(request, 'api_request_id', '')
+            split_data = {
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': f'{split_strategy.title()}-based split job queued for processing',
                 'split_info': {
                     'strategy': split_strategy,
                     'total_pages': max_page,
@@ -716,7 +754,7 @@ class SplitAPIView(APIView):
             
             # Add strategy-specific info to response
             if split_strategy == 'pattern':
-                response_data['split_info']['pattern_info'] = {
+                split_data['split_info']['pattern_info'] = {
                     'pattern': pattern,
                     'pattern_type': pattern_type,
                     'fuzzy_threshold': fuzzy_threshold,
@@ -724,21 +762,35 @@ class SplitAPIView(APIView):
                     'test_matches_found': pattern_test.get('test_matches', 0)
                 }
             else:
-                response_data['split_info']['split_pages'] = split_pages
+                split_data['split_info']['split_pages'] = split_pages
             
-            return Response(response_data)
+            response_data = APIResponseFormatter.format_success_response(
+                split_data,
+                message=f'{split_strategy.title()}-based split job queued for processing',
+                request_id=request_id
+            )
+            
+            # Return 202 for queued background jobs, 200 for pending jobs
+            status_code = 202 if job.status == 'queued' else 200
+            return APIResponseFormatter.create_json_response(response_data, status_code=status_code)
             
         except PDFDocument.DoesNotExist:
-            return Response(
-                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'].to_dict(),
-                status=status.HTTP_404_NOT_FOUND
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_404_NOT_FOUND)
+        except APIError as e:
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(e, request_id)
+            return APIResponseFormatter.create_json_response(error_response, e.status)
         except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
             logger.error(f"Split error: {str(e)}")
-            return Response(
-                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class MergeAPIView(APIView):
@@ -758,6 +810,13 @@ class MergeAPIView(APIView):
             'estimated_minutes': round(estimated_seconds / 60, 1)
         }
     
+    @log_api_call()
+    @require_session_id
+    @require_content_type('application/json')
+    @timeout_handler(sync_timeout=30, background_threshold=25)
+    @rate_limit(requests_per_minute=60)
+    @validate_request_data(required_fields=['document_ids'])
+    @monitor_performance
     def post(self, request):
         """Start PDF merging process with enhanced parameters."""
         try:
@@ -865,25 +924,32 @@ class MergeAPIView(APIView):
             job.processing_parameters = merge_params
             job.save()
             
+            # Check for timeout hint from middleware
+            should_queue = getattr(request, 'timeout_hint', False) or True  # Default to queuing for merges
+            
             # Queue background task for processing
-            try:
-                from tasks import process_pdf_merge
-                process_pdf_merge.delay(document_ids, str(job.id), merge_params)
-                job.status = 'queued'
-                job.save()
-            except ImportError:
-                logger.warning("Celery not available, processing will be synchronous")
+            if should_queue:
+                try:
+                    from tasks import process_pdf_merge
+                    process_pdf_merge.delay(document_ids, str(job.id), merge_params)
+                    job.status = 'queued'
+                    job.save()
+                except ImportError:
+                    logger.warning("Celery not available, processing will be synchronous")
+                    job.status = 'pending'
+                    job.save()
+                    should_queue = False  # Reset since we can't queue
+            else:
                 job.status = 'pending'
                 job.save()
             
             # Calculate processing time estimate
             processing_estimate = self._estimate_processing_time(total_size, total_pages, len(documents))
             
-            return Response({
-                'success': True,
+            request_id = getattr(request, 'api_request_id', '')
+            merge_data = {
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': 'Enhanced merge job queued for processing',
                 'merge_info': {
                     'total_documents': len(documents),
                     'total_pages': total_pages,
@@ -895,25 +961,57 @@ class MergeAPIView(APIView):
                     'output_filename': output_filename,
                     'custom_order': custom_order if merge_strategy == 'custom' else None
                 }
-            })
+            }
             
-        except Exception as e:
-            logger.error(f"Merge error: {str(e)}")
-            return Response(
-                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            response_data = APIResponseFormatter.format_success_response(
+                merge_data,
+                message='Enhanced merge job queued for processing',
+                request_id=request_id
             )
+            
+            # Return 202 for queued background jobs, 200 for pending jobs
+            status_code = 202 if job.status == 'queued' else 200
+            return APIResponseFormatter.create_json_response(response_data, status_code=status_code)
+            
+        except APIError as e:
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(e, request_id)
+            return APIResponseFormatter.create_json_response(error_response, e.status)
+        except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
+            logger.error(f"Merge error: {str(e)}")
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'], request_id
+            )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class ExtractAPIView(APIView):
     """Handle PDF data extraction requests with comprehensive processing."""
     
+    @log_api_call()
+    @require_session_id
+    @require_content_type('application/json')
+    @timeout_handler(sync_timeout=30, background_threshold=25)
+    @rate_limit(requests_per_minute=60)
+    @validate_request_data(required_fields=['document_id'])
+    @monitor_performance
     def post(self, request):
         """Start PDF data extraction process."""
         try:
             document_id = request.data.get('document_id')
             extraction_type = request.data.get('extraction_type', 'text')
             page_range = request.data.get('page_range', None)  # [start, end] or None for all
+            
+            # Additional extraction parameters
+            csv_delimiter = request.data.get('csv_delimiter', ',')
+            image_format = request.data.get('image_format', 'PNG')
+            image_quality = request.data.get('image_quality', 95)
+            output_format = request.data.get('output_format', 'json')
+            include_formatting = request.data.get('include_formatting', False)
+            table_extraction_method = request.data.get('table_extraction_method', 'auto')
+            include_headers = request.data.get('include_headers', None)
+            dpi = request.data.get('dpi', 300)
             
             if not document_id:
                 raise APIError(
@@ -923,13 +1021,47 @@ class ExtractAPIView(APIView):
                 )
             
             # Validate extraction type
-            valid_types = ['text', 'metadata', 'images', 'all']
+            valid_types = ['text', 'metadata', 'images', 'tables', 'all']
             if extraction_type not in valid_types:
                 raise APIError(
                     f"Invalid extraction type. Must be one of: {', '.join(valid_types)}",
                     "INVALID_EXTRACTION_TYPE",
                     status.HTTP_400_BAD_REQUEST
                 )
+            
+            # Use centralized parameter validation
+            extraction_parameters = {
+                'page_range': page_range,
+                'csv_delimiter': csv_delimiter,
+                'image_format': image_format,
+                'image_quality': image_quality,
+                'output_format': output_format,
+                'include_formatting': include_formatting,
+                'table_extraction_method': table_extraction_method,
+                'include_headers': include_headers,
+                'dpi': dpi
+            }
+            
+            validation_result = validate_extraction_parameters(extraction_type, extraction_parameters)
+            
+            if not validation_result['valid']:
+                error_messages = validation_result['errors']
+                raise APIError(
+                    f"Parameter validation failed: {'; '.join(error_messages)}",
+                    "INVALID_EXTRACTION_PARAMETERS",
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Use sanitized parameters from validation
+            sanitized_params = validation_result['sanitized_parameters']
+            csv_delimiter = sanitized_params.get('csv_delimiter', csv_delimiter)
+            image_format = sanitized_params.get('image_format', image_format)
+            image_quality = sanitized_params.get('image_quality', image_quality)
+            output_format = sanitized_params.get('output_format', output_format)
+            include_formatting = sanitized_params.get('include_formatting', include_formatting)
+            table_extraction_method = sanitized_params.get('table_extraction_method', table_extraction_method)
+            include_headers = sanitized_params.get('include_headers', include_headers)
+            dpi = sanitized_params.get('dpi', dpi)
             
             document = PDFDocument.objects.get(id=document_id)
             
@@ -978,60 +1110,193 @@ class ExtractAPIView(APIView):
                         status.HTTP_400_BAD_REQUEST
                     )
             
-            # Create processing job
+            # Create processing job with enhanced parameters
+            processing_parameters = {
+                'extraction_type': extraction_type,
+                'page_range': page_range,
+                'document_path': str(file_path),
+                'total_pages': max_pages,
+                'has_text_layer': pdf_info.get('has_text_layer', False),
+                'csv_delimiter': csv_delimiter,
+                'image_format': image_format,
+                'image_quality': image_quality,
+                'output_format': output_format,
+                'include_formatting': include_formatting,
+                'table_extraction_method': table_extraction_method,
+                'include_headers': include_headers,
+                'dpi': dpi
+            }
+            
             job = ProcessingJob.objects.create(
                 document=document,
                 job_type='extract',
-                processing_parameters={
-                    'extraction_type': extraction_type,
-                    'page_range': page_range,
-                    'document_path': str(file_path),
-                    'total_pages': max_pages,
-                    'has_text_layer': pdf_info.get('has_text_layer', False)
-                }
+                processing_parameters=processing_parameters
             )
             
+            # Check for timeout hint from middleware
+            should_queue = getattr(request, 'timeout_hint', False) or True  # Default to queuing for extractions
+            
             # Queue background task for processing
-            try:
-                from tasks import process_pdf_extraction
-                process_pdf_extraction.delay(str(document.id), str(job.id), extraction_type, page_range)
-                job.status = 'queued'
-                job.save()
-            except ImportError:
-                logger.warning("Celery not available, processing will be synchronous")
+            if should_queue:
+                try:
+                    from tasks import process_pdf_extraction
+                    # Pass extraction options as additional parameter
+                    extraction_options = {
+                        'csv_delimiter': csv_delimiter,
+                        'image_format': image_format,
+                        'image_quality': image_quality,
+                        'output_format': output_format,
+                        'include_formatting': include_formatting,
+                        'table_extraction_method': table_extraction_method,
+                        'include_headers': include_headers,
+                        'dpi': dpi
+                    }
+                    process_pdf_extraction.delay(str(document.id), str(job.id), extraction_type, page_range, extraction_options)
+                    job.status = 'queued'
+                    job.save()
+                except ImportError:
+                    logger.warning("Celery not available, processing will be synchronous")
+                    job.status = 'pending'
+                    job.save()
+                    should_queue = False  # Reset since we can't queue
+            else:
                 job.status = 'pending'
                 job.save()
             
-            return Response({
-                'success': True,
+            # Add extraction capability assessment
+            extraction_capabilities = self._assess_extraction_capabilities(
+                pdf_info, extraction_type, max_pages
+            )
+            
+            request_id = getattr(request, 'api_request_id', '')
+            extraction_data = {
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': 'Extraction job queued for processing',
                 'extraction_info': {
                     'extraction_type': extraction_type,
                     'page_range': page_range or f"1-{max_pages}",
                     'total_pages': max_pages,
                     'has_text_layer': pdf_info.get('has_text_layer', False),
-                    'requires_ocr': not pdf_info.get('has_text_layer', False) and extraction_type in ['text', 'all']
+                    'requires_ocr': not pdf_info.get('has_text_layer', False) and extraction_type in ['text', 'all'],
+                    'extraction_parameters': {
+                        'csv_delimiter': csv_delimiter if extraction_type in ['tables', 'all'] else None,
+                        'image_format': image_format if extraction_type in ['images', 'all'] else None,
+                        'image_quality': image_quality if extraction_type in ['images', 'all'] else None,
+                        'output_format': output_format,
+                        'include_formatting': include_formatting,
+                        'table_extraction_method': table_extraction_method if extraction_type in ['tables', 'all'] else None,
+                        'include_headers': include_headers if extraction_type in ['tables', 'all'] else None,
+                        'dpi': dpi
+                    },
+                    'capabilities_assessment': extraction_capabilities
                 }
-            })
+            }
+            
+            response_data = APIResponseFormatter.format_success_response(
+                extraction_data,
+                message='Enhanced extraction job queued for processing',
+                request_id=request_id
+            )
+            
+            # Return 202 for queued background jobs, 200 for pending jobs
+            status_code = 202 if job.status == 'queued' else 200
+            return APIResponseFormatter.create_json_response(response_data, status_code=status_code)
             
         except PDFDocument.DoesNotExist:
-            return Response(
-                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'].to_dict(),
-                status=status.HTTP_404_NOT_FOUND
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['DOCUMENT_NOT_FOUND'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_404_NOT_FOUND)
+        except APIError as e:
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(e, request_id)
+            return APIResponseFormatter.create_json_response(error_response, e.status)
         except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
             logger.error(f"Extraction error: {str(e)}")
-            return Response(
-                ERROR_MAPPINGS['PROCESSING_ERROR'].to_dict(),
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['PROCESSING_ERROR'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
+    
+    def _assess_extraction_capabilities(self, pdf_info: dict, extraction_type: str, page_count: int) -> dict:
+        """Assess PDF's suitability for different extraction types.
+        
+        Args:
+            pdf_info: PDF validation information
+            extraction_type: Type of extraction requested
+            page_count: Number of pages in PDF
+            
+        Returns:
+            Dictionary with capability assessment
+        """
+        try:
+            assessment = {
+                'text_extraction': {
+                    'feasible': True,
+                    'confidence': 'high' if pdf_info.get('has_text_layer', False) else 'medium',
+                    'method': 'text_layer' if pdf_info.get('has_text_layer', False) else 'ocr_required',
+                    'estimated_quality': 'excellent' if pdf_info.get('has_text_layer', False) else 'good'
+                },
+                'table_extraction': {
+                    'feasible': True,
+                    'confidence': 'medium',
+                    'method': 'auto_detection',
+                    'estimated_tables': 'unknown',
+                    'note': 'Will use intelligent method selection based on PDF structure'
+                },
+                'image_extraction': {
+                    'feasible': True,
+                    'confidence': 'high',
+                    'method': 'embedded_extraction',
+                    'estimated_images': 'unknown',
+                    'note': 'Will extract embedded images and optionally render pages'
+                },
+                'metadata_extraction': {
+                    'feasible': True,
+                    'confidence': 'high',
+                    'method': 'comprehensive_analysis',
+                    'estimated_completeness': 'high'
+                }
+            }
+            
+            # Adjust assessments based on document characteristics
+            if page_count > 100:
+                assessment['text_extraction']['note'] = 'Large document - text layer extraction recommended for performance'
+                assessment['table_extraction']['confidence'] = 'medium-high'
+                assessment['table_extraction']['note'] += ' (optimized for large documents)'
+            
+            if page_count > 50:
+                assessment['image_extraction']['note'] += ' (page rendering disabled for performance)'
+            
+            # Filter assessment based on extraction type
+            if extraction_type == 'text':
+                return {'text_extraction': assessment['text_extraction']}
+            elif extraction_type == 'tables':
+                return {'table_extraction': assessment['table_extraction']}
+            elif extraction_type == 'images':
+                return {'image_extraction': assessment['image_extraction']}
+            elif extraction_type == 'metadata':
+                return {'metadata_extraction': assessment['metadata_extraction']}
+            else:  # 'all'
+                return assessment
+                
+        except Exception as e:
+            logger.warning(f"Error assessing extraction capabilities: {e}")
+            return {
+                'assessment_error': 'Could not assess extraction capabilities',
+                'default_confidence': 'medium',
+                'note': 'Extraction will proceed with default settings'
+            }
 
 
 class JobStatusView(APIView):
     """Check processing job status with comprehensive progress tracking."""
     
+    @log_api_call()
+    @rate_limit(requests_per_minute=120)
+    @monitor_performance
     def get(self, request, job_id):
         """Get detailed job status, progress, and results."""
         try:
@@ -1049,26 +1314,46 @@ class JobStatusView(APIView):
                         'estimated_finish': (timezone.now() + timedelta(seconds=remaining_time)).isoformat()
                     }
             
-            # Prepare comprehensive response
-            response_data = {
-                'success': True,
+            # Prepare job info for APIResponseFormatter
+            job_info = {
                 'job_id': str(job.id),
                 'status': job.status,
                 'progress': job.progress,
-                'job_type': job.job_type,
+                'operation_type': job.job_type,
                 'document_id': str(job.document.id),
                 'document_filename': job.document.filename,
                 'created_at': job.created_at.isoformat(),
                 'updated_at': job.updated_at.isoformat(),
                 'processing_parameters': getattr(job, 'processing_parameters', {}),
                 'estimated_completion': estimated_completion,
-                'results': getattr(job, 'results', None) if job.status == 'completed' else None,
-                'error_messages': job.error_messages if job.status == 'failed' else None,
+                'result': getattr(job, 'results', None) if job.status == 'completed' else None,
+                'error_message': job.error_messages if job.status == 'failed' else None,
                 'resource_usage': self._get_resource_usage_info(job),
                 'can_cancel': job.status in ['queued', 'processing']
             }
             
-            return Response(response_data)
+            request_id = getattr(request, 'api_request_id', '')
+            response_data = APIResponseFormatter.format_job_status_response(
+                job_info,
+                include_details=True,
+                request_id=request_id
+            )
+            
+            return APIResponseFormatter.create_json_response(response_data)
+            
+        except ProcessingJob.DoesNotExist:
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['JOB_NOT_FOUND'], request_id
+            )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_404_NOT_FOUND)
+        except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
+            logger.error(f"Status check error: {str(e)}")
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['SERVER_ERROR'], request_id
+            )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
     
     def _get_resource_usage_info(self, job):
         """Get resource usage information for the job."""
@@ -1110,29 +1395,40 @@ class JobStatusView(APIView):
             job.error_messages = ['Job cancelled by user request']
             job.save()
             
-            return Response({
-                'success': True,
+            request_id = getattr(request, 'api_request_id', '')
+            success_data = {
                 'job_id': str(job.id),
-                'status': 'cancelled',
-                'message': 'Job cancelled successfully'
-            })
+                'status': 'cancelled'
+            }
+            response_data = APIResponseFormatter.format_success_response(
+                success_data,
+                message='Job cancelled successfully',
+                request_id=request_id
+            )
+            
+            return APIResponseFormatter.create_json_response(response_data)
             
         except ProcessingJob.DoesNotExist:
-            return Response(
-                ERROR_MAPPINGS['JOB_NOT_FOUND'].to_dict(),
-                status=status.HTTP_404_NOT_FOUND
+            request_id = getattr(request, 'api_request_id', '')
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['JOB_NOT_FOUND'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_404_NOT_FOUND)
         except Exception as e:
+            request_id = getattr(request, 'api_request_id', '')
             logger.error(f"Status check error: {str(e)}")
-            return Response(
-                ERROR_MAPPINGS['SERVER_ERROR'].to_dict(),
-                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            error_response = APIResponseFormatter.format_error_response(
+                ERROR_MAPPINGS['SERVER_ERROR'], request_id
             )
+            return APIResponseFormatter.create_json_response(error_response, status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 class RedactionDownloadView(APIView):
     """Handle redacted PDF downloads."""
     
+    @log_api_call()
+    @rate_limit(requests_per_minute=120)
+    @monitor_performance
     def get(self, request, job_id):
         """Download the redacted PDF file."""
         try:
@@ -1187,3 +1483,7 @@ class RedactionDownloadView(APIView):
                 ERROR_MAPPINGS['SERVER_ERROR'].to_dict(),
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
+
+
+# Create alias for the generic file download view
+FileDownloadView = RedactionDownloadView

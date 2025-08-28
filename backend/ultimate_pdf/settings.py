@@ -26,12 +26,17 @@ INSTALLED_APPS = [
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
     'corsheaders.middleware.CorsMiddleware',
+    'app.middleware.api_middleware.APIRequestMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
     'django.middleware.common.CommonMiddleware',
     'django.middleware.csrf.CsrfViewMiddleware',
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+    'app.middleware.timeout_middleware.TimeoutHandlerMiddleware',
+    'app.middleware.api_middleware.APIRateLimitMiddleware',
+    'app.middleware.api_middleware.APIErrorHandlerMiddleware',
+    'app.middleware.api_middleware.APIResponseMiddleware',
 ]
 
 ROOT_URLCONF = 'ultimate_pdf.urls'
@@ -116,6 +121,7 @@ CSRF_COOKIE_SECURE = False  # Set to True in production
 SESSION_COOKIE_SECURE = False  # Set to True in production
 SECURE_CONTENT_TYPE_NOSNIFF = True
 SECURE_BROWSER_XSS_FILTER = True
+SECURE_REFERRER_POLICY = 'strict-origin-when-cross-origin'
 X_FRAME_OPTIONS = 'DENY'
 
 # CORS Settings
@@ -123,6 +129,52 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:3000",
     "http://127.0.0.1:3000",
 ]
+CORS_ALLOW_CREDENTIALS = True
+CORS_EXPOSE_HEADERS = ['X-Request-ID', 'X-Processing-Time', 'X-Timeout-Warning']
+CORS_ALLOWED_HEADERS = [
+    'accept',
+    'accept-encoding',
+    'authorization',
+    'content-type',
+    'dnt',
+    'origin',
+    'user-agent',
+    'x-csrftoken',
+    'x-requested-with',
+    'x-session-id',
+    'x-background-processing',
+]
+
+# API-specific settings
+API_REQUEST_TIMEOUT = 30  # seconds for synchronous operations
+API_BACKGROUND_THRESHOLD = 25  # seconds before queuing background tasks
+
+# Rate Limiting Configuration
+# ============================
+# The API implements two-tier rate limiting:
+# 1. Global middleware rate limiting (APIRateLimitMiddleware) - applies to all API endpoints
+# 2. Decorator-based rate limiting (@rate_limit) - for endpoint-specific limits
+#
+# When both are active, they operate independently:
+# - Global middleware checks first, enforcing the global limit
+# - Decorator checks second, enforcing endpoint-specific limits
+# - Both must pass for a request to succeed
+#
+# Global rate limit settings:
+API_RATE_LIMIT_REQUESTS = 100  # requests per minute per IP (global limit)
+API_RATE_LIMIT_WINDOW = 60  # rate limit window in seconds
+#
+# Endpoint-specific limits are set via @rate_limit decorator in views, e.g.:
+# @rate_limit(requests_per_minute=60) for more restrictive limits
+#
+# Rate limit exceeded responses:
+# - Return HTTP 429 status code
+# - Include Retry-After header with window duration
+# - Provide structured error response with request_id
+
+API_MAX_REQUEST_SIZE = 100 * 1024 * 1024  # 100MB max request size
+API_ENABLE_COMPRESSION = True  # enable response compression
+API_ENABLE_CACHING = True  # enable response caching
 
 # REST Framework Settings
 REST_FRAMEWORK = {
@@ -180,6 +232,16 @@ LOGGING = {
         'app': {
             'handlers': ['file', 'console'],
             'level': 'DEBUG',
+            'propagate': False,
+        },
+        'app.middleware': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
+            'propagate': False,
+        },
+        'structlog': {
+            'handlers': ['file', 'console'],
+            'level': 'INFO',
             'propagate': False,
         },
     },

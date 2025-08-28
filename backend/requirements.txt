@@ -20,3 +20,15 @@ django-extensions==3.2.3
 gunicorn==21.2.0
 whitenoise==6.6.0
 dataclasses-json==0.6.3
+# Table detection and extraction dependencies
+camelot-py[cv]==0.11.0
+tabula-py==2.9.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+# Note: System dependencies required:
+# 1. Ghostscript for camelot-py:
+#    Ubuntu/Debian: sudo apt-get install ghostscript
+#    macOS: brew install ghostscript
+# 2. Java Runtime Environment for tabula-py:
+#    Ubuntu/Debian: sudo apt-get install default-jre
+#    macOS: brew install openjdk

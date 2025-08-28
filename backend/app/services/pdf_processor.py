@@ -14,6 +14,9 @@ from .temp_file_manager import TempFileManager
 from .pdf_splitter import PDFSplitter
 from .pdf_merger import PDFMerger
 from ..utils.validators import validate_split_pattern
+from .table_extraction_service import TableExtractionService
+from .image_extraction_service import ImageExtractionService
+from .metadata_extraction_service import MetadataExtractionService
 
 logger = logging.getLogger(__name__)
 
@@ -1065,4 +1068,437 @@ class PDFProcessor:
                 'operation': operation,
                 'total_files': len(file_paths),
                 'results': []
+            }
+    
+    def extract_tables(
+        self,
+        file_path: Path,
+        page_range: Optional[Tuple[int, int]] = None,
+        csv_delimiter: str = ',',
+        extraction_method: str = 'auto'
+    ) -> Dict[str, Any]:
+        """Extract tables from PDF file using TableExtractionService.
+        
+        Args:
+            file_path: Path to the PDF file
+            page_range: Optional tuple of (start_page, end_page) (1-indexed)
+            csv_delimiter: Delimiter for CSV export
+            extraction_method: Method to use ('auto', 'camelot', 'tabula')
+            
+        Returns:
+            Dictionary containing table extraction results
+        """
+        try:
+            logger.info(f"Starting table extraction from {file_path}")
+            
+            # Validate PDF first
+            validation_result = self.validate_pdf(file_path)
+            if not validation_result['is_valid']:
+                return {
+                    'success': False,
+                    'error': f"Invalid PDF: {validation_result.get('error', 'Unknown error')}",
+                    'tables': [],
+                    'files': []
+                }
+            
+            # Use TableExtractionService
+            table_service = TableExtractionService(self.session_id)
+            result = table_service.extract_tables(
+                file_path=file_path,
+                page_range=page_range,
+                extraction_method=extraction_method,
+                csv_delimiter=csv_delimiter
+            )
+            
+            logger.info(f"Table extraction completed: {result.get('success', False)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Table extraction error for {file_path}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'tables': [],
+                'files': []
+            }
+    
+    def extract_images_enhanced(
+        self,
+        file_path: Path,
+        page_range: Optional[Tuple[int, int]] = None,
+        output_format: str = 'PNG',
+        quality: int = 95,
+        include_page_renders: bool = False
+    ) -> Dict[str, Any]:
+        """Extract images from PDF using enhanced ImageExtractionService.
+        
+        Args:
+            file_path: Path to the PDF file
+            page_range: Optional tuple of (start_page, end_page) (1-indexed)
+            output_format: Target output format ('PNG', 'JPEG', 'TIFF', 'WEBP')
+            quality: Output quality for JPEG (1-100)
+            include_page_renders: Whether to also render pages as images
+            
+        Returns:
+            Dictionary containing image extraction results
+        """
+        try:
+            logger.info(f"Starting enhanced image extraction from {file_path}")
+            
+            # Validate PDF first
+            validation_result = self.validate_pdf(file_path)
+            if not validation_result['is_valid']:
+                return {
+                    'success': False,
+                    'error': f"Invalid PDF: {validation_result.get('error', 'Unknown error')}",
+                    'images': [],
+                    'files': []
+                }
+            
+            # Use ImageExtractionService
+            image_service = ImageExtractionService(self.session_id)
+            result = image_service.extract_images(
+                file_path=file_path,
+                page_range=page_range,
+                output_format=output_format,
+                quality=quality,
+                include_page_renders=include_page_renders
+            )
+            
+            logger.info(f"Enhanced image extraction completed: {result.get('success', False)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Enhanced image extraction error for {file_path}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'images': [],
+                'files': []
+            }
+    
+    def extract_metadata_structured(
+        self,
+        file_path: Path,
+        output_format: str = 'json',
+        include_analysis: bool = True
+    ) -> Dict[str, Any]:
+        """Extract comprehensive metadata using MetadataExtractionService.
+        
+        Args:
+            file_path: Path to the PDF file
+            output_format: Output format ('json' only supported currently)
+            include_analysis: Whether to include content analysis
+            
+        Returns:
+            Dictionary containing metadata extraction results
+        """
+        try:
+            logger.info(f"Starting structured metadata extraction from {file_path}")
+            
+            # Validate PDF first
+            validation_result = self.validate_pdf(file_path)
+            if not validation_result['is_valid']:
+                return {
+                    'success': False,
+                    'error': f"Invalid PDF: {validation_result.get('error', 'Unknown error')}",
+                    'metadata': {},
+                    'files': []
+                }
+            
+            # Use MetadataExtractionService
+            metadata_service = MetadataExtractionService(self.session_id)
+            result = metadata_service.extract_metadata(
+                file_path=file_path,
+                include_content_analysis=include_analysis,
+                include_security_info=True,
+                output_format=output_format
+            )
+            
+            logger.info(f"Structured metadata extraction completed: {result.get('success', False)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"Structured metadata extraction error for {file_path}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'metadata': {},
+                'files': []
+            }
+    
+    def extract_comprehensive(
+        self,
+        file_path: Path,
+        page_range: Optional[Tuple[int, int]] = None,
+        extraction_options: Optional[Dict[str, Any]] = None
+    ) -> Dict[str, Any]:
+        """Extract all content types from PDF using all extraction services.
+        
+        Args:
+            file_path: Path to the PDF file
+            page_range: Optional tuple of (start_page, end_page) (1-indexed)
+            extraction_options: Optional dictionary of extraction parameters
+            
+        Returns:
+            Dictionary containing comprehensive extraction results
+        """
+        try:
+            logger.info(f"Starting comprehensive extraction from {file_path}")
+            
+            # Default options
+            if extraction_options is None:
+                extraction_options = {}
+            
+            # Validate PDF first
+            validation_result = self.validate_pdf(file_path)
+            if not validation_result['is_valid']:
+                return {
+                    'success': False,
+                    'error': f"Invalid PDF: {validation_result.get('error', 'Unknown error')}",
+                    'results': {}
+                }
+            
+            comprehensive_results = {
+                'success': True,
+                'extraction_summary': {
+                    'file_path': str(file_path),
+                    'page_range': page_range,
+                    'extraction_timestamp': datetime.now().isoformat(),
+                    'services_used': [],
+                    'total_files_created': 0
+                },
+                'results': {},
+                'all_files': []
+            }
+            
+            extraction_errors = []
+            
+            # Extract text (existing method)
+            try:
+                text_result = self.extract_text(file_path)
+                if text_result['success']:
+                    comprehensive_results['results']['text'] = text_result
+                    comprehensive_results['extraction_summary']['services_used'].append('text_extraction')
+                else:
+                    comprehensive_results['results']['text'] = {
+                        'success': False,
+                        'error': text_result.get('error', 'Unknown error'),
+                        'pages': [],
+                        'total_pages': 0,
+                        'has_text': False
+                    }
+                    extraction_errors.append(f"Text extraction: {text_result.get('error', 'Unknown error')}")
+            except Exception as e:
+                comprehensive_results['results']['text'] = {
+                    'success': False,
+                    'error': str(e),
+                    'pages': [],
+                    'total_pages': 0,
+                    'has_text': False
+                }
+                extraction_errors.append(f"Text extraction failed: {e}")
+            
+            # Extract tables
+            try:
+                table_result = self.extract_tables(
+                    file_path,
+                    page_range=page_range,
+                    csv_delimiter=extraction_options.get('csv_delimiter', ','),
+                    extraction_method=extraction_options.get('table_extraction_method', 'auto')
+                )
+                if table_result['success']:
+                    comprehensive_results['results']['tables'] = table_result
+                    comprehensive_results['extraction_summary']['services_used'].append('table_extraction')
+                    comprehensive_results['all_files'].extend(table_result.get('files', []))
+                else:
+                    comprehensive_results['results']['tables'] = {
+                        'success': False,
+                        'error': table_result.get('error', 'Unknown error'),
+                        'tables': [],
+                        'files': []
+                    }
+                    extraction_errors.append(f"Table extraction: {table_result.get('error', 'Unknown error')}")
+            except Exception as e:
+                comprehensive_results['results']['tables'] = {
+                    'success': False,
+                    'error': str(e),
+                    'tables': [],
+                    'files': []
+                }
+                extraction_errors.append(f"Table extraction failed: {e}")
+            
+            # Extract images
+            try:
+                image_result = self.extract_images_enhanced(
+                    file_path,
+                    page_range=page_range,
+                    output_format=extraction_options.get('image_format', 'PNG'),
+                    quality=extraction_options.get('image_quality', 95),
+                    include_page_renders=extraction_options.get('include_page_renders', False)
+                )
+                if image_result['success']:
+                    comprehensive_results['results']['images'] = image_result
+                    comprehensive_results['extraction_summary']['services_used'].append('image_extraction')
+                    comprehensive_results['all_files'].extend(image_result.get('files', []))
+                else:
+                    comprehensive_results['results']['images'] = {
+                        'success': False,
+                        'error': image_result.get('error', 'Unknown error'),
+                        'images': [],
+                        'files': []
+                    }
+                    extraction_errors.append(f"Image extraction: {image_result.get('error', 'Unknown error')}")
+            except Exception as e:
+                comprehensive_results['results']['images'] = {
+                    'success': False,
+                    'error': str(e),
+                    'images': [],
+                    'files': []
+                }
+                extraction_errors.append(f"Image extraction failed: {e}")
+            
+            # Extract metadata
+            try:
+                metadata_result = self.extract_metadata_structured(
+                    file_path,
+                    output_format=extraction_options.get('metadata_format', 'json'),
+                    include_analysis=extraction_options.get('include_content_analysis', True)
+                )
+                if metadata_result['success']:
+                    comprehensive_results['results']['metadata'] = metadata_result
+                    comprehensive_results['extraction_summary']['services_used'].append('metadata_extraction')
+                    comprehensive_results['all_files'].extend(metadata_result.get('files', []))
+                else:
+                    comprehensive_results['results']['metadata'] = {
+                        'success': False,
+                        'error': metadata_result.get('error', 'Unknown error'),
+                        'metadata': {},
+                        'files': []
+                    }
+                    extraction_errors.append(f"Metadata extraction: {metadata_result.get('error', 'Unknown error')}")
+            except Exception as e:
+                comprehensive_results['results']['metadata'] = {
+                    'success': False,
+                    'error': str(e),
+                    'metadata': {},
+                    'files': []
+                }
+                extraction_errors.append(f"Metadata extraction failed: {e}")
+            
+            # Update summary
+            comprehensive_results['extraction_summary']['total_files_created'] = len(comprehensive_results['all_files'])
+            comprehensive_results['extraction_summary']['extraction_errors'] = extraction_errors
+            
+            # Count successful vs failed services
+            successful_services = sum(1 for result in comprehensive_results['results'].values() if result.get('success', False))
+            comprehensive_results['extraction_summary']['services_successful'] = successful_services
+            comprehensive_results['extraction_summary']['services_failed'] = len(comprehensive_results['results']) - successful_services
+            comprehensive_results['extraction_summary']['services_total'] = len(comprehensive_results['results'])
+            
+            # Ensure files_created contains all available files from successful services
+            comprehensive_results['files_created'] = comprehensive_results['all_files']
+            
+            # Determine overall success
+            if not comprehensive_results['results'] and extraction_errors:
+                comprehensive_results['success'] = False
+                comprehensive_results['error'] = f"All extractions failed: {'; '.join(extraction_errors)}"
+            elif extraction_errors:
+                comprehensive_results['partial_success'] = True
+                comprehensive_results['warning'] = f"Some extractions failed: {'; '.join(extraction_errors)}"
+            
+            logger.info(f"Comprehensive extraction completed: {len(comprehensive_results['results'])} services successful")
+            return comprehensive_results
+            
+        except Exception as e:
+            logger.error(f"Comprehensive extraction error for {file_path}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'results': {}
+            }
+    
+    def _determine_optimal_extraction_strategy(self, file_path: Path) -> Dict[str, Any]:
+        """Analyze PDF characteristics and recommend extraction methods.
+        
+        Args:
+            file_path: Path to the PDF file
+            
+        Returns:
+            Dictionary with extraction strategy recommendations
+        """
+        try:
+            recommendations = {
+                'text_extraction': {
+                    'recommended_method': 'auto',
+                    'reason': 'Standard approach',
+                    'confidence': 0.8
+                },
+                'table_extraction': {
+                    'recommended_method': 'auto',
+                    'reason': 'Will determine best approach based on PDF structure',
+                    'confidence': 0.7,
+                    'likely_success': True
+                },
+                'image_extraction': {
+                    'recommended_format': 'PNG',
+                    'include_page_renders': False,
+                    'reason': 'PNG preserves quality without size issues',
+                    'confidence': 0.9
+                }
+            }
+            
+            # Analyze PDF characteristics
+            validation_result = self.validate_pdf(file_path)
+            if not validation_result['is_valid']:
+                return {
+                    'success': False,
+                    'error': validation_result.get('error'),
+                    'recommendations': recommendations
+                }
+            
+            has_text_layer = validation_result.get('has_text_layer', False)
+            page_count = validation_result.get('page_count', 0)
+            
+            # Adjust text extraction recommendations
+            if not has_text_layer:
+                recommendations['text_extraction'] = {
+                    'recommended_method': 'ocr',
+                    'reason': 'No text layer detected, OCR required',
+                    'confidence': 0.6
+                }
+            elif page_count > 100:
+                recommendations['text_extraction'] = {
+                    'recommended_method': 'text_layer',
+                    'reason': 'Large document, text layer is faster',
+                    'confidence': 0.9
+                }
+            
+            # Adjust table extraction recommendations
+            if page_count > 50:
+                recommendations['table_extraction']['recommended_method'] = 'camelot'
+                recommendations['table_extraction']['reason'] = 'Large document, camelot is more efficient'
+                recommendations['table_extraction']['confidence'] = 0.8
+            
+            # Adjust image extraction recommendations
+            if page_count > 20:
+                recommendations['image_extraction']['include_page_renders'] = False
+                recommendations['image_extraction']['reason'] = 'Large document, extract embedded images only'
+            
+            return {
+                'success': True,
+                'recommendations': recommendations,
+                'document_characteristics': {
+                    'has_text_layer': has_text_layer,
+                    'page_count': page_count,
+                    'file_size_mb': round(file_path.stat().st_size / (1024 * 1024), 2)
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"Error determining extraction strategy for {file_path}: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'recommendations': recommendations
             }

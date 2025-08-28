@@ -31,6 +31,16 @@ class APIError(Exception):
         self.details = details or {}
         super().__init__(self.message)
     
+    @property
+    def error_code(self) -> str:
+        """Property accessor for error_code -> code mapping."""
+        return self.code
+    
+    @property
+    def status_code(self) -> int:
+        """Property accessor for status_code -> status mapping."""
+        return self.status
+    
     def to_dict(self) -> Dict[str, Any]:
         """Convert error to dictionary format for API responses.
         
@@ -181,6 +191,28 @@ class FileError(APIError):
         
         self.file_path = file_path
         self.operation = operation
+
+
+class AuthenticationError(APIError):
+    """Specialized error for authentication failures."""
+    
+    def __init__(
+        self,
+        message: str = "Authentication failed",
+        details: Optional[Dict[str, Any]] = None
+    ):
+        """Initialize authentication error.
+        
+        Args:
+            message: Authentication error message
+            details: Additional authentication details
+        """
+        super().__init__(
+            message=message,
+            code='AUTHENTICATION_ERROR',
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            details=details
+        )
 
 
 # Predefined error mappings for common scenarios

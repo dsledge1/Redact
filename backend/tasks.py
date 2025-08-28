@@ -1179,15 +1179,17 @@ def process_pdf_extraction(
     document_id: str, 
     job_id: str, 
     extraction_type: str, 
-    page_range: List[int] = None
+    page_range: List[int] = None,
+    extraction_options: Dict[str, Any] = None
 ) -> Dict[str, Any]:
-    """Process PDF text/metadata/image extraction in the background.
+    """Process PDF text/metadata/image/table extraction in the background.
     
     Args:
         document_id: UUID of the document to process
         job_id: Processing job UUID
-        extraction_type: Type of extraction ('text', 'metadata', 'images', 'comprehensive')
+        extraction_type: Type of extraction ('text', 'metadata', 'images', 'tables', 'all')
         page_range: Optional page range to limit extraction
+        extraction_options: Additional extraction parameters
         
     Returns:
         Dictionary with extraction processing results
@@ -1198,10 +1200,10 @@ def process_pdf_extraction(
         document = PDFDocument.objects.get(id=document_id)
         
         job.status = 'processing'
-        job.progress = 10
+        job.progress = 5
         job.save()
         
-        logger.info(f"Starting PDF extraction ({extraction_type}) for job {job_id}, document {document.filename}")
+        logger.info(f"Starting enhanced PDF extraction ({extraction_type}) for job {job_id}, document {document.filename}")
         
         # Get file path
         upload_path = TempFileManager.get_session_path(document.session_id, 'uploads')
@@ -1213,47 +1215,104 @@ def process_pdf_extraction(
         # Initialize PDF processor
         processor = PDFProcessor(document.session_id)
         
-        job.progress = 25
+        # Parse extraction options
+        if extraction_options is None:
+            extraction_options = {}
+            
+        # Convert page range to tuple if provided
+        page_range_tuple = None
+        if page_range and len(page_range) >= 2:
+            page_range_tuple = (page_range[0], page_range[1])
+        
+        job.progress = 15
         job.save()
         
-        # Perform extraction based on type
+        # Perform extraction based on type using enhanced methods
         if extraction_type == 'text':
-            result = processor.extract_text(pdf_file)
-        elif extraction_type == 'metadata':
-            result = processor.extract_advanced_metadata(pdf_file)
-        elif extraction_type == 'images':
-            result = processor.extract_embedded_files(pdf_file)
-        elif extraction_type == 'comprehensive':
-            # Perform all extractions
-            text_result = processor.extract_text(pdf_file)
-            metadata_result = processor.extract_advanced_metadata(pdf_file)
-            files_result = processor.extract_embedded_files(pdf_file)
+            job.progress = 30
+            job.save()
             
-            result = {
-                'success': text_result['success'] and metadata_result['success'],
-                'text_extraction': text_result,
-                'metadata_extraction': metadata_result,
-                'files_extraction': files_result
-            }
+            # Use enhanced text extraction with structured output
+            from app.services.text_extraction_service import TextExtractionService
+            text_service = TextExtractionService(document.session_id)
+            result = text_service.extract_structured_text(
+                pdf_file,
+                page_range=page_range_tuple,
+                output_format=extraction_options.get('output_format', 'json'),
+                include_formatting=extraction_options.get('include_formatting', False)
+            )
+            
+        elif extraction_type == 'metadata':
+            job.progress = 30
+            job.save()
+            
+            result = processor.extract_metadata_structured(
+                pdf_file,
+                output_format=extraction_options.get('output_format', 'json'),
+                include_analysis=extraction_options.get('include_content_analysis', True)
+            )
+            
+        elif extraction_type == 'images':
+            job.progress = 30
+            job.save()
+            
+            result = processor.extract_images_enhanced(
+                pdf_file,
+                page_range=page_range_tuple,
+                output_format=extraction_options.get('image_format', 'PNG'),
+                quality=extraction_options.get('image_quality', 95)
+            )
+            
+        elif extraction_type == 'tables':
+            job.progress = 30
+            job.save()
+            
+            result = processor.extract_tables(
+                pdf_file,
+                page_range=page_range_tuple,
+                csv_delimiter=extraction_options.get('csv_delimiter', ','),
+                extraction_method=extraction_options.get('table_extraction_method', 'auto')
+            )
+            
+        elif extraction_type == 'all':
+            # Comprehensive extraction using all services
+            job.progress = 20
+            job.save()
+            
+            result = processor.extract_comprehensive(
+                pdf_file,
+                page_range=page_range_tuple,
+                extraction_options=extraction_options
+            )
+            
         else:
             raise ValueError(f"Unknown extraction type: {extraction_type}")
         
-        job.progress = 75
+        job.progress = 85
         job.save()
         
-        if result['success']:
+        if result.get('success', False):
             job.status = 'completed'
             job.progress = 100
             job.results = {
                 'extraction_type': extraction_type,
+                'extraction_options': extraction_options,
                 'result': result
             }
             
-            logger.info(f"Successfully completed PDF extraction ({extraction_type}) for job {job_id}")
+            # Log extraction statistics
+            if 'statistics' in result:
+                logger.info(f"Extraction statistics for job {job_id}: {result['statistics']}")
+            
+            if 'files' in result and result['files']:
+                logger.info(f"Created {len(result['files'])} output files for job {job_id}")
+            
+            logger.info(f"Successfully completed enhanced PDF extraction ({extraction_type}) for job {job_id}")
         else:
             job.status = 'failed'
-            job.error_messages = result.get('error', f'Unknown {extraction_type} extraction error')
-            logger.error(f"PDF extraction ({extraction_type}) failed for job {job_id}: {job.error_messages}")
+            error_msg = result.get('error', f'Unknown {extraction_type} extraction error')
+            job.error_messages = error_msg if isinstance(error_msg, list) else [error_msg]
+            logger.error(f"PDF extraction ({extraction_type}) failed for job {job_id}: {error_msg}")
         
         job.save()
         
@@ -1261,10 +1320,11 @@ def process_pdf_extraction(
         TempFileManager.schedule_cleanup(document.session_id)
         
         return {
-            'success': result['success'],
+            'success': result.get('success', False),
             'job_id': job_id,
             'document_id': document_id,
             'extraction_type': extraction_type,
+            'extraction_options': extraction_options,
             'result': result
         }
         

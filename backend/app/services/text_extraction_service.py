@@ -12,6 +12,7 @@ from django.core.cache import cache
 
 from .pdf_processor import PDFProcessor
 from .ocr_service import OCRService
+from app.utils.temp_file_manager import TempFileManager
 
 logger = logging.getLogger(__name__)
 
@@ -63,6 +64,7 @@ class TextExtractionService:
         self.session_id = session_id
         self.pdf_processor = pdf_processor or PDFProcessor(session_id)
         self.ocr_service = ocr_service or OCRService()
+        self.temp_file_manager = TempFileManager(session_id)
         
         # Statistics tracking
         self.extraction_stats = {
@@ -1044,3 +1046,558 @@ class TextExtractionService:
                 'error': str(e),
                 'cleared_keys': 0
             }
+    
+    def extract_structured_text(
+        self,
+        file_path: Path,
+        page_range: Optional[Tuple[int, int]] = None,
+        output_format: str = 'json',
+        include_formatting: bool = False,
+        export_to_files: bool = True
+    ) -> Dict[str, Any]:
+        """Extract text with structured output and multiple format support.
+        
+        Args:
+            file_path: Path to the PDF file
+            page_range: Optional tuple of (start_page, end_page) (1-indexed)
+            output_format: Output format ('json', 'txt', 'structured')
+            include_formatting: Whether to preserve formatting information
+            export_to_files: Whether to export results to files
+            
+        Returns:
+            Dictionary containing structured extraction results
+        """
+        try:
+            logger.info(f"Starting structured text extraction from {file_path}")
+            
+            # Use existing unified extraction as base
+            base_result = self.extract_text_unified(
+                file_path,
+                method=ExtractionMethod.AUTO,
+                page_range=page_range,
+                include_confidence=True
+            )
+            
+            if not base_result['success']:
+                return base_result
+            
+            # Extract structured text with formatting if requested
+            if include_formatting:
+                formatting_result = self._extract_text_with_formatting(file_path, page_range)
+                if formatting_result['success']:
+                    # Merge formatting data with base result
+                    for page in base_result['pages']:
+                        page_num = page['page_number']
+                        formatting_page = next(
+                            (p for p in formatting_result['pages'] if p['page_number'] == page_num),
+                            None
+                        )
+                        if formatting_page:
+                            page['formatting_data'] = formatting_page.get('formatting_data', {})
+            
+            # Organize text by structure
+            structured_data = self._organize_text_by_structure(base_result['pages'])
+            
+            # Calculate text statistics
+            text_stats = self._calculate_text_statistics(structured_data)
+            
+            # Detect language
+            language = self._detect_text_language_enhanced(structured_data.get('full_text', ''))
+            
+            # Prepare structured result
+            structured_result = {
+                'success': True,
+                'structured_data': structured_data,
+                'text_statistics': text_stats,
+                'language_info': language,
+                'extraction_metadata': {
+                    'include_formatting': include_formatting,
+                    'output_format': output_format,
+                    'extraction_method': base_result.get('extraction_method', 'auto'),
+                    'pages_processed': len(base_result['pages']),
+                    'page_range': page_range
+                },
+                'files': []
+            }
+            
+            # Export to files if requested
+            if export_to_files:
+                export_result = self._export_text_to_formats(
+                    structured_data,
+                    [output_format]
+                )
+                if export_result:
+                    structured_result['files'] = export_result
+            
+            logger.info("Structured text extraction completed successfully")
+            return structured_result
+            
+        except Exception as e:
+            logger.error(f"Structured text extraction error: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'structured_data': {},
+                'files': []
+            }
+    
+    def _extract_text_with_formatting(
+        self,
+        file_path: Path,
+        page_range: Optional[Tuple[int, int]] = None
+    ) -> Dict[str, Any]:
+        """Extract text with formatting and layout information.
+        
+        Args:
+            file_path: Path to the PDF file
+            page_range: Optional page range
+            
+        Returns:
+            Dictionary containing text with formatting data
+        """
+        try:
+            import fitz  # PyMuPDF
+            
+            doc = fitz.open(str(file_path))
+            total_pages = len(doc)
+            
+            # Determine pages to process
+            if page_range:
+                start, end = page_range
+                start = max(1, start) - 1  # Convert to 0-indexed
+                end = min(total_pages, end)
+                pages_to_process = list(range(start, end))
+            else:
+                pages_to_process = list(range(total_pages))
+            
+            formatted_pages = []
+            
+            for page_num in pages_to_process:
+                page = doc.load_page(page_num)
+                
+                # Extract text with detailed formatting
+                text_dict = page.get_text("dict")
+                
+                # Process text blocks with formatting
+                text_blocks = []
+                fonts_used = set()
+                
+                for block in text_dict.get("blocks", []):
+                    if "lines" in block:  # Text block
+                        block_data = {
+                            'bbox': block.get('bbox', []),
+                            'lines': []
+                        }
+                        
+                        for line in block["lines"]:
+                            line_data = {
+                                'bbox': line.get('bbox', []),
+                                'spans': []
+                            }
+                            
+                            for span in line["spans"]:
+                                font_info = f"{span.get('font', '')}_{span.get('size', 0)}_{span.get('flags', 0)}"
+                                fonts_used.add(font_info)
+                                
+                                span_data = {
+                                    'text': span.get('text', ''),
+                                    'font': span.get('font', ''),
+                                    'size': span.get('size', 0),
+                                    'flags': span.get('flags', 0),
+                                    'color': span.get('color', 0),
+                                    'bbox': span.get('bbox', []),
+                                    'is_bold': bool(span.get('flags', 0) & 2**4),
+                                    'is_italic': bool(span.get('flags', 0) & 2**1),
+                                }
+                                
+                                line_data['spans'].append(span_data)
+                            
+                            block_data['lines'].append(line_data)
+                        
+                        text_blocks.append(block_data)
+                
+                # Combine all text for the page
+                page_text = page.get_text()
+                
+                formatting_data = {
+                    'text_blocks': text_blocks,
+                    'fonts_used': list(fonts_used),
+                    'page_dimensions': {
+                        'width': page.rect.width,
+                        'height': page.rect.height
+                    },
+                    'text_coverage': len(page_text.strip()) / (page.rect.width * page.rect.height) if page.rect.width * page.rect.height > 0 else 0
+                }
+                
+                formatted_pages.append({
+                    'page_number': page_num + 1,
+                    'text': page_text,
+                    'formatting_data': formatting_data
+                })
+            
+            doc.close()
+            
+            return {
+                'success': True,
+                'pages': formatted_pages
+            }
+            
+        except Exception as e:
+            logger.error(f"Error extracting text with formatting: {e}")
+            return {
+                'success': False,
+                'error': str(e),
+                'pages': []
+            }
+    
+    def _organize_text_by_structure(self, text_data: List[Dict]) -> Dict[str, Any]:
+        """Organize extracted text by structural elements.
+        
+        Args:
+            text_data: List of page text data
+            
+        Returns:
+            Dictionary with organized text structure
+        """
+        full_text = ""
+        pages_data = []
+        paragraphs = []
+        headers = []
+        
+        for page in text_data:
+            page_text = page.get('text', '')
+            full_text += page_text + "\n"
+            
+            # Simple paragraph detection by double line breaks
+            page_paragraphs = [p.strip() for p in page_text.split('\n\n') if p.strip()]
+            
+            # Simple header detection (lines that are short and followed by longer text)
+            lines = page_text.split('\n')
+            page_headers = []
+            
+            for i, line in enumerate(lines):
+                line = line.strip()
+                if (len(line) < 100 and len(line) > 5 and 
+                    i < len(lines) - 1 and len(lines[i + 1].strip()) > len(line)):
+                    # Potential header
+                    page_headers.append({
+                        'text': line,
+                        'page': page['page_number'],
+                        'line_number': i + 1
+                    })
+            
+            paragraphs.extend(page_paragraphs)
+            headers.extend(page_headers)
+            
+            pages_data.append({
+                'page_number': page['page_number'],
+                'text': page_text,
+                'paragraphs': page_paragraphs,
+                'headers': page_headers,
+                'text_length': len(page_text),
+                'extraction_source': page.get('extraction_source', 'unknown'),
+                'confidence': page.get('extraction_confidence', 0.0)
+            })
+        
+        return {
+            'full_text': full_text.strip(),
+            'pages': pages_data,
+            'paragraphs': paragraphs,
+            'headers': headers,
+            'total_pages': len(pages_data),
+            'total_paragraphs': len(paragraphs),
+            'total_headers': len(headers)
+        }
+    
+    def _export_text_to_formats(
+        self,
+        text_data: Dict[str, Any],
+        formats: List[str]
+    ) -> List[Dict[str, Any]]:
+        """Export text data to multiple formats.
+        
+        Args:
+            text_data: Structured text data
+            formats: List of output formats ('json', 'txt', 'structured')
+            
+        Returns:
+            List of exported file information
+        """
+        exported_files = []
+        downloads_dir = self.temp_file_manager.downloads_dir
+        
+        for format_type in formats:
+            try:
+                if format_type.lower() == 'json':
+                    # Export as JSON
+                    filename = f'text_structured_{self.session_id[:8]}.json'
+                    file_path = downloads_dir / filename
+                    
+                    export_data = {
+                        'extraction_info': {
+                            'timestamp': datetime.now().isoformat(),
+                            'format': 'structured_json',
+                            'session_id': self.session_id
+                        },
+                        'text_data': text_data
+                    }
+                    
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        json.dump(export_data, f, indent=2, ensure_ascii=False)
+                    
+                elif format_type.lower() == 'txt':
+                    # Export as plain text
+                    filename = f'text_extracted_{self.session_id[:8]}.txt'
+                    file_path = downloads_dir / filename
+                    
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write(text_data.get('full_text', ''))
+                
+                elif format_type.lower() == 'structured':
+                    # Export as structured text with sections
+                    filename = f'text_structured_{self.session_id[:8]}.txt'
+                    file_path = downloads_dir / filename
+                    
+                    with open(file_path, 'w', encoding='utf-8') as f:
+                        f.write("=== DOCUMENT STRUCTURE ===\n\n")
+                        
+                        # Write headers
+                        if text_data.get('headers'):
+                            f.write("HEADERS:\n")
+                            for header in text_data['headers']:
+                                f.write(f"- {header['text']} (Page {header['page']})\n")
+                            f.write("\n")
+                        
+                        # Write full text by pages
+                        f.write("=== FULL TEXT BY PAGES ===\n\n")
+                        for page in text_data.get('pages', []):
+                            f.write(f"--- Page {page['page_number']} ---\n")
+                            f.write(page['text'])
+                            f.write("\n\n")
+                
+                else:
+                    logger.warning(f"Unsupported export format: {format_type}")
+                    continue
+                
+                file_info = {
+                    'filename': filename,
+                    'file_path': str(file_path),
+                    'file_size': file_path.stat().st_size,
+                    'format': format_type.lower(),
+                    'type': 'structured_text'
+                }
+                
+                exported_files.append(file_info)
+                logger.info(f"Exported structured text to {filename}")
+                
+            except Exception as e:
+                logger.error(f"Error exporting to {format_type}: {e}")
+                continue
+        
+        return exported_files
+    
+    def _detect_text_language_enhanced(self, text: str) -> Dict[str, Any]:
+        """Enhanced language detection for extracted text.
+        
+        Args:
+            text: Text to analyze
+            
+        Returns:
+            Dictionary with language detection results
+        """
+        if not text or len(text.strip()) < 50:
+            return {
+                'primary_language': 'unknown',
+                'confidence': 0.0,
+                'languages_detected': [],
+                'text_sample_length': len(text.strip())
+            }
+        
+        # Simple language detection based on character patterns and common words
+        text_lower = text.lower()
+        
+        # English indicators
+        english_words = ['the', 'and', 'or', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'a', 'an', 'is', 'are', 'was', 'were']
+        english_score = sum(1 for word in english_words if f' {word} ' in f' {text_lower} ')
+        
+        # Spanish indicators
+        spanish_words = ['el', 'la', 'de', 'en', 'y', 'es', 'un', 'una', 'con', 'por', 'para', 'que', 'del', 'los', 'las']
+        spanish_score = sum(1 for word in spanish_words if f' {word} ' in f' {text_lower} ')
+        
+        # French indicators
+        french_words = ['le', 'de', 'et', 'à', 'un', 'une', 'ce', 'que', 'qui', 'dans', 'avec', 'sur', 'pour', 'du', 'des']
+        french_score = sum(1 for word in french_words if f' {word} ' in f' {text_lower} ')
+        
+        # German indicators
+        german_words = ['der', 'die', 'und', 'in', 'den', 'von', 'zu', 'das', 'mit', 'ist', 'im', 'für', 'auf', 'eine', 'einen']
+        german_score = sum(1 for word in german_words if f' {word} ' in f' {text_lower} ')
+        
+        scores = {
+            'english': english_score,
+            'spanish': spanish_score,
+            'french': french_score,
+            'german': german_score
+        }
+        
+        # Determine primary language
+        max_score = max(scores.values())
+        if max_score >= 3:
+            primary_language = max(scores, key=scores.get)
+            confidence = min(max_score / 20.0, 1.0)  # Normalize to 0-1
+        else:
+            primary_language = 'unknown'
+            confidence = 0.0
+        
+        # Languages detected (those with significant scores)
+        detected_languages = [lang for lang, score in scores.items() if score >= 2]
+        
+        return {
+            'primary_language': primary_language,
+            'confidence': confidence,
+            'languages_detected': detected_languages,
+            'language_scores': scores,
+            'text_sample_length': len(text.strip())
+        }
+    
+    def _calculate_text_statistics(self, text_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Calculate comprehensive text statistics.
+        
+        Args:
+            text_data: Structured text data
+            
+        Returns:
+            Dictionary with text statistics
+        """
+        full_text = text_data.get('full_text', '')
+        
+        if not full_text:
+            return {
+                'total_characters': 0,
+                'total_words': 0,
+                'total_sentences': 0,
+                'average_words_per_sentence': 0,
+                'average_characters_per_word': 0,
+                'reading_time_minutes': 0,
+                'complexity_score': 0.0
+            }
+        
+        # Basic counts
+        total_chars = len(full_text)
+        total_chars_no_spaces = len(full_text.replace(' ', ''))
+        words = full_text.split()
+        total_words = len(words)
+        
+        # Sentence count (simple approximation)
+        sentences = [s.strip() for s in full_text.replace('!', '.').replace('?', '.').split('.') if s.strip()]
+        total_sentences = len(sentences)
+        
+        # Calculate averages
+        avg_words_per_sentence = total_words / max(total_sentences, 1)
+        avg_chars_per_word = total_chars_no_spaces / max(total_words, 1)
+        
+        # Reading time (average 250 words per minute)
+        reading_time = max(1, round(total_words / 250))
+        
+        # Simple complexity score based on sentence length and word length
+        complexity_factors = []
+        if avg_words_per_sentence > 20:
+            complexity_factors.append(0.3)  # Long sentences
+        if avg_chars_per_word > 6:
+            complexity_factors.append(0.2)  # Long words
+        if total_words > 5000:
+            complexity_factors.append(0.2)  # Long document
+        
+        complexity_score = sum(complexity_factors)
+        
+        # Page-level statistics
+        page_stats = []
+        for page in text_data.get('pages', []):
+            page_text = page.get('text', '')
+            page_words = len(page_text.split())
+            
+            page_stats.append({
+                'page_number': page['page_number'],
+                'characters': len(page_text),
+                'words': page_words,
+                'confidence': page.get('confidence', 0.0)
+            })
+        
+        return {
+            'total_characters': total_chars,
+            'total_characters_no_spaces': total_chars_no_spaces,
+            'total_words': total_words,
+            'total_sentences': total_sentences,
+            'average_words_per_sentence': round(avg_words_per_sentence, 1),
+            'average_characters_per_word': round(avg_chars_per_word, 1),
+            'reading_time_minutes': reading_time,
+            'complexity_score': round(complexity_score, 2),
+            'page_statistics': page_stats,
+            'total_pages': len(text_data.get('pages', [])),
+            'total_paragraphs': text_data.get('total_paragraphs', 0),
+            'total_headers': text_data.get('total_headers', 0)
+        }
+    
+    def _validate_text_quality(self, text: str, confidence_threshold: float = 0.8) -> Dict[str, Any]:
+        """Validate text extraction quality.
+        
+        Args:
+            text: Extracted text to validate
+            confidence_threshold: Minimum confidence threshold
+            
+        Returns:
+            Dictionary with quality validation results
+        """
+        if not text:
+            return {
+                'is_valid': False,
+                'quality_score': 0.0,
+                'issues': ['No text content'],
+                'recommendations': ['Check if PDF contains readable text or try OCR']
+            }
+        
+        issues = []
+        recommendations = []
+        quality_factors = []
+        
+        # Check text length
+        if len(text.strip()) < 50:
+            issues.append('Very short text content')
+            recommendations.append('Verify PDF contains readable text')
+            quality_factors.append(0.2)
+        else:
+            quality_factors.append(0.8)
+        
+        # Check for garbled text (high ratio of special characters)
+        text_chars = len([c for c in text if c.isalnum() or c.isspace()])
+        total_chars = len(text)
+        if total_chars > 0:
+            text_ratio = text_chars / total_chars
+            if text_ratio < 0.7:
+                issues.append('High ratio of non-text characters')
+                recommendations.append('Consider using OCR for better text extraction')
+                quality_factors.append(0.3)
+            else:
+                quality_factors.append(0.9)
+        
+        # Check for repeated patterns (possible OCR errors)
+        words = text.split()
+        if len(words) > 10:
+            unique_words = set(words)
+            if len(unique_words) / len(words) < 0.5:
+                issues.append('High repetition in text')
+                recommendations.append('Review extraction quality and consider alternative methods')
+                quality_factors.append(0.4)
+            else:
+                quality_factors.append(0.8)
+        
+        quality_score = sum(quality_factors) / len(quality_factors) if quality_factors else 0.0
+        is_valid = quality_score >= confidence_threshold and len(issues) == 0
+        
+        return {
+            'is_valid': is_valid,
+            'quality_score': quality_score,
+            'issues': issues,
+            'recommendations': recommendations,
+            'text_length': len(text),
+            'word_count': len(words) if 'words' in locals() else 0
+        }
