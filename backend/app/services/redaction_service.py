@@ -16,8 +16,9 @@ import PyPDF2
 from PyPDF2 import PdfReader, PdfWriter
 from PyPDF2.generic import RectangleObject
 
-from app.models import RedactionMatch, ProcessingJob
+from app.models import RedactionMatch, ProcessingJob, OCRResult
 from app.services.temp_file_manager import TempFileManager
+from app.services.bounding_box_calculator import BoundingBoxCalculator
 from app.utils.errors import (
     PDFProcessingError,
     RedactionError,
@@ -75,7 +76,7 @@ class RedactionService:
             self._validate_redaction_input(file_path, matches)
             
             # Ensure all matches have bounding boxes
-            validated_matches = self._ensure_bounding_boxes(matches)
+            validated_matches = self._ensure_bounding_boxes(matches, file_path)
             
             # Group matches by page
             matches_by_page = self._group_matches_by_page(validated_matches)
@@ -179,38 +180,272 @@ class RedactionService:
     
     def _ensure_bounding_boxes(
         self, 
-        matches: List[RedactionMatch]
+        matches: List[RedactionMatch],
+        pdf_path: Optional[Path] = None
     ) -> List[RedactionMatch]:
         """
-        Validate and compute missing bounding box coordinates.
+        Validate and compute missing bounding box coordinates using BoundingBoxCalculator.
         
         Args:
             matches: List of redaction matches
+            pdf_path: Path to PDF file for coordinate calculation
             
         Returns:
             List of matches with validated coordinates
         """
         validated_matches = []
+        calculator = BoundingBoxCalculator()
         
-        for match in matches:
-            # Check if coordinates exist
-            if all([
-                match.x_coordinate is not None,
-                match.y_coordinate is not None,
-                match.width is not None,
-                match.height is not None
-            ]):
-                validated_matches.append(match)
-            else:
-                # Log warning about missing coordinates
-                self.logger.warning(
-                    f"Match {match.id} missing coordinates, will attempt calculation"
+        try:
+            for match in matches:
+                # Check if coordinates already exist and are valid
+                if self._has_valid_coordinates(match):
+                    validated_matches.append(match)
+                    continue
+                
+                # Log attempt to calculate missing coordinates
+                self.logger.info(
+                    f"Match {match.id} missing coordinates, attempting calculation for text: '{match.matched_text[:50]}...'"
                 )
-                # In production, would call BoundingBoxCalculator here
-                # For now, skip matches without coordinates
-                continue
+                
+                # Attempt coordinate calculation
+                best_box = self._calculate_best_bounding_box(
+                    calculator, match, pdf_path
+                )
+                
+                if best_box:
+                    # Attach computed coordinates to the match
+                    self._attach_coordinates_to_match(match, best_box)
+                    
+                    # Persist the updated match
+                    try:
+                        match.save()
+                        self.logger.debug(f"Successfully calculated and saved coordinates for match {match.id}")
+                    except Exception as e:
+                        self.logger.warning(f"Failed to save calculated coordinates for match {match.id}: {str(e)}")
+                    
+                    validated_matches.append(match)
+                else:
+                    self.logger.warning(
+                        f"Could not calculate coordinates for match {match.id} with text: '{match.matched_text[:50]}...'"
+                    )
+                    # Skip matches without calculable coordinates
+                    continue
+                    
+        finally:
+            # Clean up calculator cache
+            calculator.clear_cache()
                 
         return validated_matches
+    
+    def _has_valid_coordinates(self, match: RedactionMatch) -> bool:
+        """
+        Check if match has valid coordinates.
+        
+        Args:
+            match: RedactionMatch to validate
+            
+        Returns:
+            Boolean indicating if coordinates are valid
+        """
+        return all([
+            match.x_coordinate is not None,
+            match.y_coordinate is not None,
+            match.width is not None,
+            match.height is not None,
+            match.width > 0,
+            match.height > 0
+        ])
+    
+    def _calculate_best_bounding_box(
+        self, 
+        calculator: BoundingBoxCalculator, 
+        match: RedactionMatch,
+        pdf_path: Optional[Path]
+    ) -> Optional['BoundingBox']:
+        """
+        Calculate the best bounding box for a match using multiple methods.
+        
+        Args:
+            calculator: BoundingBoxCalculator instance
+            match: RedactionMatch without coordinates
+            pdf_path: Path to PDF file
+            
+        Returns:
+            Best BoundingBox found or None if no suitable box found
+        """
+        if not pdf_path:
+            self.logger.warning("No PDF path provided for coordinate calculation")
+            return None
+            
+        all_boxes = []
+        
+        # Method 1: Text layer search
+        try:
+            text_layer_boxes = calculator.calculate_text_layer_boxes(
+                str(pdf_path), 
+                match.matched_text, 
+                page_number=match.page_number
+            )
+            all_boxes.extend(text_layer_boxes)
+            self.logger.debug(f"Found {len(text_layer_boxes)} boxes from text layer for match {match.id}")
+        except Exception as e:
+            self.logger.debug(f"Text layer calculation failed for match {match.id}: {str(e)}")
+        
+        # Method 2: Fallback calculation if text layer failed
+        if not all_boxes:
+            try:
+                fallback_boxes = calculator.calculate_fallback_boxes(
+                    str(pdf_path),
+                    match.matched_text,
+                    match.page_number
+                )
+                all_boxes.extend(fallback_boxes)
+                self.logger.debug(f"Found {len(fallback_boxes)} boxes from fallback method for match {match.id}")
+            except Exception as e:
+                self.logger.debug(f"Fallback calculation failed for match {match.id}: {str(e)}")
+        
+        # Method 3: OCR boxes if available and other methods failed
+        if not all_boxes:
+            try:
+                ocr_boxes = self._get_ocr_boxes(calculator, match)
+                all_boxes.extend(ocr_boxes)
+                self.logger.debug(f"Found {len(ocr_boxes)} boxes from OCR for match {match.id}")
+            except Exception as e:
+                self.logger.debug(f"OCR calculation failed for match {match.id}: {str(e)}")
+        
+        if not all_boxes:
+            return None
+            
+        # Choose the best box (highest confidence)
+        best_box = max(all_boxes, key=lambda box: box.confidence)
+        
+        # Expand margins for better coverage
+        try:
+            # Get page dimensions for margin expansion validation
+            import fitz
+            doc = fitz.open(str(pdf_path))
+            page = doc[match.page_number]
+            page_dimensions = {
+                'width': page.rect.width,
+                'height': page.rect.height
+            }
+            doc.close()
+            
+            best_box = calculator.expand_box_margins(
+                best_box, 
+                margin_pixels=2.0,
+                page_dimensions=page_dimensions
+            )
+        except Exception as e:
+            self.logger.warning(f"Failed to expand margins for match {match.id}: {str(e)}")
+        
+        # Validate coordinates
+        if self._validate_box_coordinates(best_box, pdf_path):
+            return best_box
+        else:
+            self.logger.warning(f"Best box coordinates failed validation for match {match.id}")
+            return None
+    
+    def _get_ocr_boxes(
+        self, 
+        calculator: BoundingBoxCalculator, 
+        match: RedactionMatch
+    ) -> List['BoundingBox']:
+        """
+        Get bounding boxes from OCR results if available.
+        
+        Args:
+            calculator: BoundingBoxCalculator instance
+            match: RedactionMatch to find OCR boxes for
+            
+        Returns:
+            List of BoundingBox objects from OCR data
+        """
+        try:
+            # Find OCR results for this document and page
+            ocr_results = OCRResult.objects.filter(
+                document=match.document,
+                page_number=match.page_number
+            ).order_by('-confidence_score')
+            
+            if not ocr_results.exists():
+                return []
+            
+            # Use the highest confidence OCR result
+            best_ocr_result = ocr_results.first()
+            return calculator.calculate_ocr_boxes(best_ocr_result, match.matched_text)
+            
+        except Exception as e:
+            self.logger.error(f"Error retrieving OCR boxes for match {match.id}: {str(e)}")
+            return []
+    
+    def _validate_box_coordinates(
+        self, 
+        box: 'BoundingBox', 
+        pdf_path: Path
+    ) -> bool:
+        """
+        Validate bounding box coordinates against PDF page dimensions.
+        
+        Args:
+            box: BoundingBox to validate
+            pdf_path: Path to PDF file
+            
+        Returns:
+            Boolean indicating if coordinates are valid
+        """
+        try:
+            import fitz
+            doc = fitz.open(str(pdf_path))
+            
+            if box.page_number >= len(doc):
+                doc.close()
+                return False
+                
+            page = doc[box.page_number]
+            page_dimensions = {
+                'width': page.rect.width,
+                'height': page.rect.height
+            }
+            doc.close()
+            
+            # Use calculator's validation method
+            calculator = BoundingBoxCalculator()
+            return calculator.validate_coordinates(
+                box.x, box.y, box.width, box.height, page_dimensions
+            )
+            
+        except Exception as e:
+            self.logger.error(f"Error validating box coordinates: {str(e)}")
+            return False
+    
+    def _attach_coordinates_to_match(
+        self, 
+        match: RedactionMatch, 
+        box: 'BoundingBox'
+    ) -> None:
+        """
+        Attach calculated coordinates to a RedactionMatch instance.
+        
+        Args:
+            match: RedactionMatch to update
+            box: BoundingBox with calculated coordinates
+        """
+        match.x_coordinate = box.x
+        match.y_coordinate = box.y
+        match.width = box.width
+        match.height = box.height
+        
+        # Update confidence breakdown to reflect coordinate calculation
+        if not match.confidence_breakdown:
+            match.confidence_breakdown = {}
+        
+        match.confidence_breakdown.update({
+            'coordinate_source': box.source,
+            'coordinate_confidence': box.confidence,
+            'calculation_method': 'BoundingBoxCalculator'
+        })
     
     def _apply_redactions(
         self,
@@ -320,12 +555,10 @@ class RedactionService:
                     text=""  # Empty text to remove content
                 )
             else:
-                self.logger.warning(
-                    "PyPDF2 version doesn't support add_redact_annot, "
-                    "attempting alternative redaction method"
+                raise RedactionError(
+                    "Unsupported PyPDF2 version: permanent redaction cannot be performed. "
+                    "The add_redact_annot method is not available in this PyPDF2 version."
                 )
-                # Fallback: Add overlay rectangle (less secure)
-                self._add_overlay_rectangle(page, rect, options)
                 
         except Exception as e:
             self.logger.error(f"Failed to apply redaction annotation: {str(e)}")
@@ -345,9 +578,9 @@ class RedactionService:
                 page.apply_redactions()
                 self.logger.debug("Redactions permanently applied to page")
             else:
-                self.logger.warning(
-                    "PyPDF2 version doesn't support apply_redactions, "
-                    "text may still be recoverable"
+                raise RedactionError(
+                    "Unsupported PyPDF2 version: permanent redaction cannot be performed. "
+                    "The apply_redactions method is not available in this PyPDF2 version."
                 )
         except Exception as e:
             self.logger.error(f"Failed to finalize redactions: {str(e)}")
@@ -360,21 +593,20 @@ class RedactionService:
         options: Dict[str, Any]
     ) -> None:
         """
-        Fallback method: Add overlay rectangle (less secure than true redaction).
+        Raises RedactionError indicating unsupported PyPDF2 version.
         
         Args:
             page: PDF page object
             rect: Rectangle coordinates
             options: Appearance options
+            
+        Raises:
+            RedactionError: Always raises to indicate permanent redaction cannot be performed
         """
-        # This is a fallback for older PyPDF2 versions
-        # It only adds a visual overlay, not true text deletion
-        self.logger.warning(
-            "Using overlay rectangle fallback - text may still be recoverable. "
-            "Upgrade to PyPDF2 3.0+ for permanent text deletion."
+        raise RedactionError(
+            "Unsupported PyPDF2 version: permanent redaction cannot be performed. "
+            "This method would only create a visual overlay, leaving text recoverable."
         )
-        # Implementation would add a black rectangle overlay
-        pass
     
     def _update_match_records(self, matches: List[RedactionMatch]) -> None:
         """

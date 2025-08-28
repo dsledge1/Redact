@@ -11,6 +11,9 @@ from datetime import datetime
 import PyPDF2
 from PyPDF2 import PdfReader, PdfWriter
 from .temp_file_manager import TempFileManager
+from .pdf_splitter import PDFSplitter
+from .pdf_merger import PDFMerger
+from ..utils.validators import validate_split_pattern
 
 logger = logging.getLogger(__name__)
 
@@ -26,6 +29,121 @@ class PDFProcessor:
         """
         self.session_id = session_id
         self.temp_manager = TempFileManager()
+    
+    def validate_split_pattern(self, file_path: Path, pattern: str, pattern_type: str) -> Dict[str, Any]:
+        """Validate pattern before processing for pattern-based splitting.
+        
+        Args:
+            file_path: Path to PDF file
+            pattern: Pattern to validate
+            pattern_type: Type of pattern matching
+            
+        Returns:
+            Dictionary with validation results
+        """
+        try:
+            validation_result = validate_split_pattern(pattern, pattern_type)
+            if not validation_result['valid']:
+                return {
+                    'valid': False,
+                    'error': validation_result['error'],
+                    'pattern': pattern,
+                    'pattern_type': pattern_type
+                }
+            
+            # Test pattern against PDF if it exists
+            if file_path.exists():
+                splitter = PDFSplitter(self.session_id)
+                try:
+                    # Quick test to see if pattern can be found
+                    pattern_matches = splitter._detect_pattern_pages(
+                        file_path, pattern, pattern_type, 80
+                    )
+                    
+                    return {
+                        'valid': True,
+                        'pattern': pattern,
+                        'pattern_type': pattern_type,
+                        'test_matches': len(pattern_matches),
+                        'preview_matches': pattern_matches[:3]  # First 3 matches
+                    }
+                except Exception as e:
+                    return {
+                        'valid': False,
+                        'error': f"Pattern test failed: {str(e)}",
+                        'pattern': pattern,
+                        'pattern_type': pattern_type
+                    }
+            
+            return {
+                'valid': True,
+                'pattern': pattern,
+                'pattern_type': pattern_type,
+                'note': 'Pattern syntax valid, but not tested against document'
+            }
+            
+        except Exception as e:
+            logger.error(f"Pattern validation error: {str(e)}")
+            return {
+                'valid': False,
+                'error': str(e),
+                'pattern': pattern,
+                'pattern_type': pattern_type
+            }
+    
+    def get_document_outline(self, file_path: Path) -> Dict[str, Any]:
+        """Extract document structure information for merge planning.
+        
+        Args:
+            file_path: Path to PDF file
+            
+        Returns:
+            Dictionary with document outline and structure info
+        """
+        try:
+            with open(file_path, 'rb') as file:
+                reader = PdfReader(file)
+                
+                outline_info = {
+                    'has_outline': False,
+                    'outline_items': [],
+                    'total_pages': len(reader.pages),
+                    'page_labels': [],
+                    'bookmarks': []
+                }
+                
+                # Extract outline/bookmarks if available
+                if hasattr(reader, 'outline') and reader.outline:
+                    outline_info['has_outline'] = True
+                    
+                    def extract_outline_items(outline_items, level=0):
+                        items = []
+                        for item in outline_items:
+                            if isinstance(item, dict):
+                                items.append({
+                                    'title': item.get('/Title', 'Untitled'),
+                                    'level': level,
+                                    'page': None  # Would need more complex extraction
+                                })
+                            elif hasattr(item, '__iter__'):
+                                items.extend(extract_outline_items(item, level + 1))
+                        return items
+                    
+                    outline_info['outline_items'] = extract_outline_items(reader.outline)
+                
+                return {
+                    'success': True,
+                    'outline': outline_info,
+                    'error': None
+                }
+                
+        except Exception as e:
+            logger.error(f"Document outline extraction error: {str(e)}")
+            return {
+                'success': False,
+                'error': str(e),
+                'outline': {}
+            }
     
     def validate_pdf(self, file_path: Path) -> Dict[str, Any]:
         """Validate PDF file and extract basic metadata.
@@ -97,6 +215,15 @@ class PDFProcessor:
                             'modification_date': str(reader.metadata.get('/ModDate', ''))
                         }
                     
+                    # Additional checks for splitting/merging compatibility
+                    compatibility_info = {
+                        'structural_integrity': True,
+                        'splitting_compatible': not is_encrypted and page_count > 1,
+                        'merging_compatible': not is_encrypted,
+                        'has_forms': False,  # Would need deeper analysis
+                        'has_annotations': False  # Would need deeper analysis
+                    }
+                    
                     return {
                         'is_valid': True,
                         'page_count': page_count,
@@ -104,6 +231,8 @@ class PDFProcessor:
                         'is_encrypted': False,
                         'metadata': metadata,
                         'file_size': file_size,
+                        'compatibility': compatibility_info,
+                        'file_hash': self._calculate_file_hash(file_path),
                         'error': None
                     }
                     
@@ -112,7 +241,12 @@ class PDFProcessor:
                         'is_valid': False,
                         'error': f'Invalid PDF format: {str(e)}',
                         'file_size': file_size,
-                        'is_encrypted': False
+                        'is_encrypted': False,
+                        'compatibility': {
+                            'structural_integrity': False,
+                            'splitting_compatible': False,
+                            'merging_compatible': False
+                        }
                     }
                     
         except Exception as e:
@@ -121,7 +255,12 @@ class PDFProcessor:
                 'is_valid': False,
                 'error': f'Validation failed: {str(e)}',
                 'file_size': 0,
-                'is_encrypted': False
+                'is_encrypted': False,
+                'compatibility': {
+                    'structural_integrity': False,
+                    'splitting_compatible': False,
+                    'merging_compatible': False
+                }
             }
     
     def extract_text(self, file_path: Path) -> Dict[str, Any]:
@@ -192,80 +331,113 @@ class PDFProcessor:
                 'has_text': False
             }
     
-    def split_pdf(self, file_path: Path, split_pages: List[int]) -> Dict[str, Any]:
-        """Split PDF into multiple files based on page ranges.
+    def split_pdf(
+        self,
+        file_path: Path,
+        split_pages: List[int] = None,
+        pattern: str = None,
+        pattern_type: str = 'regex',
+        fuzzy_threshold: int = 80,
+        split_position: str = 'before',
+        preserve_metadata: bool = True
+    ) -> Dict[str, Any]:
+        """Split PDF into multiple files based on page ranges or patterns.
         
         Args:
             file_path: Path to the source PDF file
             split_pages: List of page numbers where to split (1-indexed)
+            pattern: Text pattern to search for (for pattern-based splitting)
+            pattern_type: Type of pattern matching ('regex', 'fuzzy', 'exact')
+            fuzzy_threshold: Threshold for fuzzy matching (1-100)
+            split_position: Position to split ('before' or 'after' pattern)
+            preserve_metadata: Whether to preserve document metadata
             
         Returns:
             Dictionary containing:
             - success: Boolean indicating if split succeeded
             - output_files: List of created file paths
             - page_ranges: List of page ranges for each output file
+            - split_type: Type of split performed ('pages' or 'pattern')
             - error: Error message if split failed
         """
         try:
-            with open(file_path, 'rb') as file:
-                reader = PdfReader(file)
-                total_pages = len(reader.pages)
+            # Initialize splitter service
+            splitter = PDFSplitter(self.session_id)
+            
+            # Determine split method and delegate to appropriate service
+            if pattern is not None:
+                # Pattern-based splitting
+                if pattern_type == 'regex':
+                    validation_result = validate_split_pattern(pattern, pattern_type)
+                    if not validation_result['valid']:
+                        return {
+                            'success': False,
+                            'error': f"Invalid pattern: {validation_result['error']}",
+                            'split_type': 'pattern'
+                        }
                 
-                if reader.is_encrypted:
+                result = splitter.split_by_pattern(
+                    file_path, pattern, pattern_type, fuzzy_threshold, split_position
+                )
+                
+                # Convert result format for backward compatibility
+                if result['success']:
+                    output_files = [output_file['path'] for output_file in result['output_files']]
+                    page_ranges = [output_file['page_range'] for output_file in result['output_files']]
+                    
+                    return {
+                        'success': True,
+                        'split_type': 'pattern',
+                        'pattern': pattern,
+                        'pattern_matches_found': result.get('pattern_matches_found', 0),
+                        'output_files': output_files,
+                        'page_ranges': page_ranges,
+                        'metadata_preserved': preserve_metadata,
+                        'error': None
+                    }
+                else:
                     return {
                         'success': False,
-                        'error': 'Cannot split encrypted PDF',
+                        'split_type': 'pattern',
+                        'error': result.get('error', 'Pattern-based split failed'),
                         'output_files': [],
                         'page_ranges': []
                     }
-                
-                # Validate split points
-                valid_splits = [p for p in split_pages if 1 <= p <= total_pages]
-                valid_splits = sorted(list(set(valid_splits)))
-                
-                # Create page ranges
-                ranges = []
-                start = 1
-                
-                for split_point in valid_splits:
-                    if split_point > start:
-                        ranges.append((start, split_point - 1))
-                        start = split_point
-                
-                # Add final range if needed
-                if start <= total_pages:
-                    ranges.append((start, total_pages))
-                
-                if not ranges:
-                    ranges = [(1, total_pages)]
-                
-                # Create split files
-                output_dir = self.temp_manager.get_session_path(self.session_id, 'downloads')
-                output_files = []
-                
-                for i, (start_page, end_page) in enumerate(ranges, 1):
-                    writer = PdfWriter()
                     
-                    # Add pages to writer (convert to 0-indexed)
-                    for page_num in range(start_page - 1, end_page):
-                        writer.add_page(reader.pages[page_num])
-                    
-                    # Create output filename
-                    base_name = file_path.stem
-                    output_filename = f"{base_name}_part_{i}_pages_{start_page}-{end_page}.pdf"
-                    output_path = output_dir / output_filename
-                    
-                    # Write the split PDF
-                    with open(output_path, 'wb') as output_file:
-                        writer.write(output_file)
-                    
-                    output_files.append(str(output_path))
+            elif split_pages is not None:
+                # Page-based splitting
+                result = splitter.split_by_pages(
+                    file_path, split_pages, preserve_metadata
+                )
                 
+                # Convert result format for backward compatibility
+                if result['success']:
+                    output_files = [output_file['path'] for output_file in result['output_files']]
+                    page_ranges = [output_file['page_range'] for output_file in result['output_files']]
+                    
+                    return {
+                        'success': True,
+                        'split_type': 'pages',
+                        'output_files': output_files,
+                        'page_ranges': page_ranges,
+                        'metadata_preserved': preserve_metadata,
+                        'error': None
+                    }
+                else:
+                    return {
+                        'success': False,
+                        'split_type': 'pages',
+                        'error': result.get('error', 'Page-based split failed'),
+                        'output_files': [],
+                        'page_ranges': []
+                    }
+            else:
+                # No split parameters provided
                 return {
-                    'success': True,
-                    'output_files': output_files,
-                    'page_ranges': [f"{start}-{end}" for start, end in ranges],
-                    'error': None
+                    'success': False,
+                    'error': 'Either split_pages or pattern must be provided',
+                    'output_files': [],
+                    'page_ranges': []
                 }
                 
         except Exception as e:
@@ -277,12 +449,20 @@ class PDFProcessor:
                 'page_ranges': []
             }
     
-    def merge_pdfs(self, file_paths: List[Path], output_filename: str = None) -> Dict[str, Any]:
+    def merge_pdfs(
+        self,
+        file_paths: List[Path],
+        output_filename: str = None,
+        preserve_metadata: bool = True,
+        merge_strategy: str = 'sequential'
+    ) -> Dict[str, Any]:
         """Merge multiple PDF files into a single document.
         
         Args:
             file_paths: List of PDF file paths to merge
             output_filename: Custom name for merged file (optional)
+            preserve_metadata: Whether to preserve and combine metadata
+            merge_strategy: Strategy for merging ('sequential', 'aggregate')
             
         Returns:
             Dictionary containing:
@@ -290,93 +470,50 @@ class PDFProcessor:
             - output_file: Path to the merged PDF file
             - total_pages: Total pages in merged document
             - source_info: Information about source files
+            - merge_strategy: Strategy used for merging
+            - metadata_preserved: Whether metadata was preserved
             - error: Error message if merge failed
         """
         try:
-            if len(file_paths) < 2:
-                return {
-                    'success': False,
-                    'error': 'At least 2 PDF files required for merging',
-                    'output_file': None,
-                    'total_pages': 0,
-                    'source_info': []
-                }
+            # Initialize merger service
+            merger = PDFMerger(self.session_id)
             
-            writer = PdfWriter()
-            source_info = []
-            total_pages = 0
+            # Delegate to merger service
+            result = merger.merge_documents(
+                file_paths, output_filename, preserve_metadata, merge_strategy
+            )
             
-            # Process each source file
-            for file_path in file_paths:
-                if not file_path.exists():
-                    logger.warning(f"Skipping non-existent file: {file_path}")
-                    continue
-                
-                try:
-                    with open(file_path, 'rb') as file:
-                        reader = PdfReader(file)
-                        
-                        if reader.is_encrypted:
-                            logger.warning(f"Skipping encrypted file: {file_path}")
-                            source_info.append({
-                                'filename': file_path.name,
-                                'pages': 0,
-                                'status': 'skipped - encrypted'
-                            })
-                            continue
-                        
-                        page_count = len(reader.pages)
-                        
-                        # Add all pages to writer
-                        for page in reader.pages:
-                            writer.add_page(page)
-                        
-                        total_pages += page_count
-                        source_info.append({
-                            'filename': file_path.name,
-                            'pages': page_count,
-                            'status': 'merged'
-                        })
-                        
-                except Exception as e:
-                    logger.error(f"Error processing {file_path}: {str(e)}")
+            # Convert result format for backward compatibility
+            if result['success']:
+                # Convert source file info format
+                source_info = []
+                for i, file_path in enumerate(file_paths):
                     source_info.append({
                         'filename': file_path.name,
-                        'pages': 0,
-                        'status': f'error - {str(e)}'
+                        'pages': 0,  # Will be filled from analysis if available
+                        'status': 'merged'
                     })
-            
-            if total_pages == 0:
+                
+                return {
+                    'success': True,
+                    'output_file': result['output_file'],
+                    'total_pages': result['total_pages'],
+                    'source_info': source_info,
+                    'merge_strategy': merge_strategy,
+                    'metadata_preserved': preserve_metadata,
+                    'statistics': result.get('statistics', {}),
+                    'error': None
+                }
+            else:
                 return {
                     'success': False,
-                    'error': 'No pages could be merged from source files',
+                    'error': result.get('error', 'Merge operation failed'),
                     'output_file': None,
                     'total_pages': 0,
-                    'source_info': source_info
+                    'source_info': [],
+                    'merge_strategy': merge_strategy
                 }
-            
-            # Create output file
-            output_dir = self.temp_manager.get_session_path(self.session_id, 'downloads')
-            
-            if not output_filename:
-                output_filename = f"merged_document_{self.session_id[:8]}.pdf"
-            
-            if not output_filename.endswith('.pdf'):
-                output_filename += '.pdf'
-            
-            output_path = output_dir / output_filename
-            
-            with open(output_path, 'wb') as output_file:
-                writer.write(output_file)
-            
-            return {
-                'success': True,
-                'output_file': str(output_path),
-                'total_pages': total_pages,
-                'source_info': source_info,
-                'error': None
-            }
-            
+                
         except Exception as e:
             logger.error(f"PDF merge error: {str(e)}")
             return {
@@ -384,7 +521,8 @@ class PDFProcessor:
                 'error': str(e),
                 'output_file': None,
                 'total_pages': 0,
-                'source_info': []
+                'source_info': [],
+                'merge_strategy': merge_strategy
             }
     
     def extract_pages_as_images(self, file_path: Path, dpi: int = 300, page_range: Optional[Tuple[int, int]] = None) -> Dict[str, Any]:

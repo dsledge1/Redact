@@ -2,11 +2,13 @@
 
 import mimetypes
 import hashlib
+import re
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 import logging
 from django.core.files.uploadedfile import UploadedFile
 from django.conf import settings
+from fuzzywuzzy import fuzz
 
 from .errors import ValidationError, FileError
 
@@ -467,12 +469,22 @@ def validate_search_terms(search_terms: List[str]) -> None:
             )
 
 
-def validate_page_numbers(page_numbers: List[int], total_pages: Optional[int] = None) -> None:
-    """Validate page numbers for PDF operations.
+def validate_page_numbers(
+    page_numbers: List[int], 
+    total_pages: Optional[int] = None,
+    allow_duplicates: bool = False,
+    require_ascending: bool = True
+) -> Dict[str, Any]:
+    """Enhanced validation for page numbers with additional options.
     
     Args:
         page_numbers: List of page numbers to validate
         total_pages: Total pages in document (for range checking)
+        allow_duplicates: Whether to allow duplicate page numbers
+        require_ascending: Whether page numbers must be in ascending order
+        
+    Returns:
+        Dictionary with validation results
         
     Raises:
         ValidationError: If page numbers are invalid
@@ -486,6 +498,14 @@ def validate_page_numbers(page_numbers: List[int], total_pages: Optional[int] = 
     
     if not page_numbers:
         raise ValidationError("At least one page number is required")
+    
+    # Validate maximum number of split points
+    if len(page_numbers) > 100:
+        raise ValidationError(
+            "Too many page numbers (maximum 100)",
+            field="page_numbers",
+            value=len(page_numbers)
+        )
     
     for i, page_num in enumerate(page_numbers):
         if not isinstance(page_num, int):
@@ -511,10 +531,462 @@ def validate_page_numbers(page_numbers: List[int], total_pages: Optional[int] = 
     
     # Check for duplicates
     unique_pages = set(page_numbers)
-    if len(unique_pages) != len(page_numbers):
+    if not allow_duplicates and len(unique_pages) != len(page_numbers):
         duplicates = [page for page in unique_pages if page_numbers.count(page) > 1]
         raise ValidationError(
             f"Duplicate page numbers found: {duplicates}",
             field="page_numbers",
             value=duplicates
         )
+    
+    # Check for ascending order
+    if require_ascending and page_numbers != sorted(page_numbers):
+        raise ValidationError(
+            "Page numbers must be in ascending order",
+            field="page_numbers",
+            value=page_numbers
+        )
+    
+    # Additional validation for split boundaries
+    if total_pages:
+        # Can't split on page 1 (would create empty first section)
+        if 1 in page_numbers:
+            raise ValidationError(
+                "Cannot split on page 1 (would create empty section)",
+                field="page_numbers",
+                value="page 1 in split points"
+            )
+    
+    return {
+        'valid': True,
+        'page_count': len(page_numbers),
+        'unique_pages': len(unique_pages),
+        'is_sorted': page_numbers == sorted(page_numbers),
+        'has_duplicates': len(unique_pages) != len(page_numbers)
+    }
+
+
+def validate_split_pattern(pattern: str, pattern_type: str) -> Dict[str, Any]:
+    """Validate pattern for pattern-based PDF splitting.
+    
+    Args:
+        pattern: Text pattern to validate
+        pattern_type: Type of pattern matching ('regex', 'fuzzy', 'exact')
+        
+    Returns:
+        Dictionary with validation results
+        
+    Raises:
+        ValidationError: If pattern is invalid
+    """
+    if not pattern:
+        return {
+            'valid': False,
+            'error': 'Pattern cannot be empty',
+            'pattern_type': pattern_type
+        }
+    
+    if not isinstance(pattern, str):
+        return {
+            'valid': False,
+            'error': 'Pattern must be a string',
+            'pattern_type': pattern_type
+        }
+    
+    # Check pattern length
+    if len(pattern) < 1 or len(pattern) > 1000:
+        return {
+            'valid': False,
+            'error': 'Pattern must be between 1 and 1000 characters',
+            'pattern_length': len(pattern)
+        }
+    
+    # Validate pattern type
+    valid_types = ['regex', 'fuzzy', 'exact']
+    if pattern_type not in valid_types:
+        return {
+            'valid': False,
+            'error': f'Pattern type must be one of: {", ".join(valid_types)}',
+            'pattern_type': pattern_type
+        }
+    
+    # Type-specific validation
+    if pattern_type == 'regex':
+        try:
+            compiled_pattern = re.compile(pattern, re.IGNORECASE | re.MULTILINE)
+            
+            # Check for potentially dangerous regex patterns
+            dangerous_patterns = [
+                r'.*\*.*\*',  # Nested quantifiers
+                r'\((.*\|.*){10,}\)',  # Too many alternations
+                r'(\w+\+){5,}',  # Excessive repetition
+            ]
+            
+            for dangerous in dangerous_patterns:
+                if re.search(dangerous, pattern):
+                    return {
+                        'valid': False,
+                        'error': 'Pattern may cause excessive backtracking (potentially dangerous)',
+                        'pattern_type': pattern_type,
+                        'complexity': 'high'
+                    }
+            
+            # Calculate pattern complexity
+            complexity_score = 0
+            complexity_score += len(re.findall(r'[\*\+\?\{\}]', pattern))  # Quantifiers
+            complexity_score += len(re.findall(r'[\(\)\[\]\|]', pattern))   # Groups and alternations
+            complexity_score += len(re.findall(r'\\[dwsWDS]', pattern))     # Character classes
+            
+            complexity = 'low' if complexity_score < 5 else 'medium' if complexity_score < 15 else 'high'
+            
+            return {
+                'valid': True,
+                'pattern_type': pattern_type,
+                'compiled_pattern': compiled_pattern.pattern,
+                'complexity': complexity,
+                'complexity_score': complexity_score
+            }
+            
+        except re.error as e:
+            return {
+                'valid': False,
+                'error': f'Invalid regex pattern: {str(e)}',
+                'pattern_type': pattern_type
+            }
+    
+    elif pattern_type == 'fuzzy':
+        # For fuzzy patterns, check they contain meaningful text
+        if not re.search(r'[a-zA-Z0-9]', pattern):
+            return {
+                'valid': False,
+                'error': 'Fuzzy pattern must contain at least some alphanumeric characters',
+                'pattern_type': pattern_type
+            }
+        
+        # Test fuzzy matching capability
+        test_ratio = fuzz.ratio(pattern.lower(), pattern.lower())
+        if test_ratio != 100:
+            return {
+                'valid': False,
+                'error': 'Fuzzy pattern validation failed',
+                'pattern_type': pattern_type
+            }
+        
+        return {
+            'valid': True,
+            'pattern_type': pattern_type,
+            'pattern_length': len(pattern),
+            'word_count': len(pattern.split())
+        }
+    
+    elif pattern_type == 'exact':
+        # For exact patterns, just ensure they're meaningful
+        if pattern.strip() != pattern:
+            return {
+                'valid': False,
+                'error': 'Exact pattern should not have leading/trailing whitespace',
+                'pattern_type': pattern_type
+            }
+        
+        return {
+            'valid': True,
+            'pattern_type': pattern_type,
+            'pattern_length': len(pattern),
+            'is_case_sensitive': pattern != pattern.lower()
+        }
+    
+    return {
+        'valid': True,
+        'pattern_type': pattern_type
+    }
+
+
+def validate_merge_parameters(
+    document_ids: List[str], 
+    merge_strategy: str, 
+    custom_order: Optional[List[str]] = None
+) -> Dict[str, Any]:
+    """Validate parameters for PDF merging operations.
+    
+    Args:
+        document_ids: List of document UUIDs to merge
+        merge_strategy: Strategy for merging ('sequential', 'aggregate', 'custom')
+        custom_order: Custom order for documents (required if strategy is 'custom')
+        
+    Returns:
+        Dictionary with validation results
+        
+    Raises:
+        ValidationError: If parameters are invalid
+    """
+    if not document_ids or not isinstance(document_ids, list):
+        return {
+            'valid': False,
+            'error': 'Document IDs must be provided as a non-empty list'
+        }
+    
+    if len(document_ids) < 2:
+        return {
+            'valid': False,
+            'error': 'At least 2 documents are required for merging'
+        }
+    
+    if len(document_ids) > 20:
+        return {
+            'valid': False,
+            'error': 'Too many documents for merging (maximum 20)'
+        }
+    
+    # Validate all document IDs are strings and appear to be UUIDs
+    import uuid
+    for i, doc_id in enumerate(document_ids):
+        if not isinstance(doc_id, str):
+            return {
+                'valid': False,
+                'error': f'Document ID at index {i} must be a string'
+            }
+        
+        try:
+            uuid.UUID(doc_id)
+        except ValueError:
+            return {
+                'valid': False,
+                'error': f'Document ID at index {i} is not a valid UUID'
+            }
+    
+    # Check for duplicate document IDs
+    unique_ids = set(document_ids)
+    if len(unique_ids) != len(document_ids):
+        duplicates = [doc_id for doc_id in unique_ids if document_ids.count(doc_id) > 1]
+        return {
+            'valid': False,
+            'error': f'Duplicate document IDs found: {duplicates[:3]}...'
+        }
+    
+    # Validate merge strategy
+    valid_strategies = ['sequential', 'aggregate', 'custom']
+    if merge_strategy not in valid_strategies:
+        return {
+            'valid': False,
+            'error': f'Merge strategy must be one of: {", ".join(valid_strategies)}'
+        }
+    
+    # Validate custom order if strategy is custom
+    if merge_strategy == 'custom':
+        if not custom_order or not isinstance(custom_order, list):
+            return {
+                'valid': False,
+                'error': 'Custom order must be provided as a list when merge strategy is "custom"'
+            }
+        
+        if len(custom_order) != len(document_ids):
+            return {
+                'valid': False,
+                'error': 'Custom order must contain all document IDs'
+            }
+        
+        if set(custom_order) != set(document_ids):
+            return {
+                'valid': False,
+                'error': 'Custom order must contain exactly the same document IDs as provided'
+            }
+    
+    return {
+        'valid': True,
+        'document_count': len(document_ids),
+        'unique_documents': len(unique_ids),
+        'merge_strategy': merge_strategy,
+        'has_custom_order': custom_order is not None
+    }
+
+
+def validate_processing_limits(
+    operation_type: str, 
+    file_count: int, 
+    total_size: int
+) -> Dict[str, Any]:
+    """Validate operation doesn't exceed system resource limits.
+    
+    Args:
+        operation_type: Type of operation ('split', 'merge', 'extract')
+        file_count: Number of files involved
+        total_size: Total size in bytes
+        
+    Returns:
+        Dictionary with validation results and resource analysis
+        
+    Raises:
+        ValidationError: If limits are exceeded
+    """
+    # Define limits based on operation type
+    limits = {
+        'split': {
+            'max_file_size': 50 * 1024 * 1024,  # 50MB
+            'max_files': 1,
+            'max_split_points': 100
+        },
+        'merge': {
+            'max_file_size': 50 * 1024 * 1024,  # 50MB per file
+            'max_total_size': 100 * 1024 * 1024,  # 100MB total
+            'max_files': 20
+        },
+        'extract': {
+            'max_file_size': 100 * 1024 * 1024,  # 100MB
+            'max_files': 1
+        }
+    }
+    
+    if operation_type not in limits:
+        return {
+            'valid': False,
+            'error': f'Unknown operation type: {operation_type}'
+        }
+    
+    operation_limits = limits[operation_type]
+    
+    # Check file count limits
+    if file_count > operation_limits.get('max_files', float('inf')):
+        return {
+            'valid': False,
+            'error': f'Too many files for {operation_type} operation (max {operation_limits["max_files"]})',
+            'file_count': file_count,
+            'limit': operation_limits['max_files']
+        }
+    
+    # Check individual file size limits
+    if operation_type in ['split', 'extract']:
+        if total_size > operation_limits['max_file_size']:
+            return {
+                'valid': False,
+                'error': f'File too large for {operation_type} operation (max {operation_limits["max_file_size"]/(1024*1024):.0f}MB)',
+                'file_size_mb': total_size / (1024 * 1024),
+                'limit_mb': operation_limits['max_file_size'] / (1024 * 1024)
+            }
+    
+    # Check total size limits for merge operations
+    if operation_type == 'merge':
+        if total_size > operation_limits['max_total_size']:
+            return {
+                'valid': False,
+                'error': f'Total file size too large for merge (max {operation_limits["max_total_size"]/(1024*1024):.0f}MB)',
+                'total_size_mb': total_size / (1024 * 1024),
+                'limit_mb': operation_limits['max_total_size'] / (1024 * 1024)
+            }
+    
+    # Calculate resource usage analysis
+    resource_analysis = {
+        'estimated_memory_mb': (total_size / (1024 * 1024)) * 2,  # Rough estimate
+        'estimated_processing_time': _estimate_processing_time(operation_type, total_size, file_count),
+        'resource_efficiency': 'high' if total_size < 10*1024*1024 else 'medium' if total_size < 50*1024*1024 else 'low'
+    }
+    
+    return {
+        'valid': True,
+        'operation_type': operation_type,
+        'file_count': file_count,
+        'total_size_mb': total_size / (1024 * 1024),
+        'resource_analysis': resource_analysis,
+        'recommendations': _generate_processing_recommendations(operation_type, total_size, file_count)
+    }
+
+
+def _estimate_processing_time(operation_type: str, total_size: int, file_count: int) -> int:
+    """Estimate processing time in seconds."""
+    base_times = {
+        'split': 5,
+        'merge': 10,
+        'extract': 15
+    }
+    
+    base_time = base_times.get(operation_type, 10)
+    size_factor = (total_size / (1024 * 1024)) * 0.5  # 0.5 seconds per MB
+    file_factor = file_count * 2  # 2 seconds per file
+    
+    return int(base_time + size_factor + file_factor)
+
+
+def _generate_processing_recommendations(operation_type: str, total_size: int, file_count: int) -> List[str]:
+    """Generate processing recommendations based on file characteristics."""
+    recommendations = []
+    
+    size_mb = total_size / (1024 * 1024)
+    
+    if size_mb > 50:
+        recommendations.append("Consider using background processing for large files")
+    
+    if file_count > 10:
+        recommendations.append("Large number of files may increase processing time")
+    
+    if operation_type == 'merge' and size_mb > 75:
+        recommendations.append("Consider optimizing PDFs before merging to reduce size")
+    
+    if operation_type == 'split' and size_mb > 25:
+        recommendations.append("Pattern-based splitting may be slower for large documents")
+    
+    return recommendations
+
+
+def validate_file_integrity(file_path: Path, expected_hash: Optional[str] = None) -> Dict[str, Any]:
+    """Calculate and verify file integrity.
+    
+    Args:
+        file_path: Path to file
+        expected_hash: Expected SHA-256 hash (optional)
+        
+    Returns:
+        Dictionary with integrity information
+        
+    Raises:
+        FileError: If file operations fail
+    """
+    try:
+        if not file_path.exists():
+            return {
+                'valid': False,
+                'error': 'File does not exist',
+                'file_path': str(file_path)
+            }
+        
+        file_size = file_path.stat().st_size
+        if file_size == 0:
+            return {
+                'valid': False,
+                'error': 'File is empty',
+                'file_size': 0
+            }
+        
+        # Calculate SHA-256 hash
+        sha256_hash = hashlib.sha256()
+        with open(file_path, 'rb') as f:
+            for chunk in iter(lambda: f.read(4096), b""):
+                sha256_hash.update(chunk)
+        
+        calculated_hash = sha256_hash.hexdigest()
+        
+        result = {
+            'valid': True,
+            'file_path': str(file_path),
+            'file_size': file_size,
+            'sha256_hash': calculated_hash
+        }
+        
+        # Verify against expected hash if provided
+        if expected_hash:
+            hash_matches = calculated_hash == expected_hash
+            result.update({
+                'expected_hash': expected_hash,
+                'hash_matches': hash_matches,
+                'valid': hash_matches
+            })
+            
+            if not hash_matches:
+                result['error'] = 'File integrity check failed (hash mismatch)'
+        
+        return result
+        
+    except Exception as e:
+        return {
+            'valid': False,
+            'error': f'Integrity check failed: {str(e)}',
+            'file_path': str(file_path)
+        }

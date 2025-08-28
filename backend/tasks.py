@@ -231,9 +231,16 @@ def process_large_pdf(
         
         # Process based on operation type
         if operation_type == 'split':
+            # Handle both page-based and pattern-based splitting
+            split_params = operation_params.copy()
             result = processor.split_pdf(
-                pdf_file, 
-                operation_params.get('split_pages', [])
+                pdf_file,
+                split_pages=split_params.get('split_pages'),
+                pattern=split_params.get('pattern'),
+                pattern_type=split_params.get('pattern_type', 'regex'),
+                fuzzy_threshold=split_params.get('fuzzy_threshold', 80),
+                split_position=split_params.get('split_position', 'before'),
+                preserve_metadata=split_params.get('preserve_metadata', True)
             )
         elif operation_type == 'merge':
             # Get all files to merge
@@ -247,7 +254,9 @@ def process_large_pdf(
             
             result = processor.merge_pdfs(
                 file_paths,
-                operation_params.get('output_filename')
+                output_filename=operation_params.get('output_filename'),
+                preserve_metadata=operation_params.get('preserve_metadata', True),
+                merge_strategy=operation_params.get('merge_strategy', 'sequential')
             )
         elif operation_type == 'extract':
             result = processor.extract_text(pdf_file)
@@ -913,6 +922,381 @@ def apply_text_redactions(
         if self.request.retries < self.max_retries:
             logger.info(f"Retrying redaction task for job {job_id} (attempt {self.request.retries + 1})")
             raise self.retry(countdown=300 * (2 ** self.request.retries), exc=exc)
+        
+        return {
+            'success': False,
+            'job_id': job_id,
+            'error': str(exc),
+            'retries': self.request.retries
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=180)
+def process_pdf_split(self, document_id: str, job_id: str, split_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Process PDF splitting operations in the background.
+    
+    Args:
+        document_id: UUID of the document to split
+        job_id: Processing job UUID
+        split_params: Split parameters (pages or pattern-based)
+        
+    Returns:
+        Dictionary with split processing results
+    """
+    try:
+        # Get the processing job and document
+        job = ProcessingJob.objects.get(id=job_id)
+        document = PDFDocument.objects.get(id=document_id)
+        
+        job.status = 'processing'
+        job.progress = 10
+        job.save()
+        
+        logger.info(f"Starting PDF split for job {job_id}, document {document.filename}")
+        
+        # Get file path
+        upload_path = TempFileManager.get_session_path(document.session_id, 'uploads')
+        pdf_file = upload_path / document.filename
+        
+        if not pdf_file.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_file}")
+        
+        # Initialize PDF processor
+        processor = PDFProcessor(document.session_id)
+        
+        job.progress = 25
+        job.save()
+        
+        # Perform split operation
+        result = processor.split_pdf(
+            pdf_file,
+            split_pages=split_params.get('split_pages'),
+            pattern=split_params.get('pattern'),
+            pattern_type=split_params.get('pattern_type', 'regex'),
+            fuzzy_threshold=split_params.get('fuzzy_threshold', 80),
+            split_position=split_params.get('split_position', 'before'),
+            preserve_metadata=split_params.get('preserve_metadata', True)
+        )
+        
+        job.progress = 75
+        job.save()
+        
+        if result['success']:
+            job.status = 'completed'
+            job.progress = 100
+            job.results = {
+                'split_type': result.get('split_type', 'pages'),
+                'output_files': result['output_files'],
+                'page_ranges': result['page_ranges'],
+                'total_files_created': len(result['output_files']),
+                'metadata_preserved': result.get('metadata_preserved', True)
+            }
+            
+            if 'pattern_matches_found' in result:
+                job.results['pattern_matches_found'] = result['pattern_matches_found']
+            
+            logger.info(f"Successfully completed PDF split for job {job_id}: {len(result['output_files'])} files created")
+        else:
+            job.status = 'failed'
+            job.error_messages = result.get('error', 'Unknown split error')
+            logger.error(f"PDF split failed for job {job_id}: {job.error_messages}")
+        
+        job.save()
+        
+        # Schedule cleanup after processing
+        TempFileManager.schedule_cleanup(document.session_id)
+        
+        return {
+            'success': result['success'],
+            'job_id': job_id,
+            'document_id': document_id,
+            'result': result
+        }
+        
+    except ProcessingJob.DoesNotExist:
+        logger.error(f"Processing job not found: {job_id}")
+        return {
+            'success': False,
+            'error': f"Job {job_id} not found"
+        }
+        
+    except PDFDocument.DoesNotExist:
+        logger.error(f"Document not found: {document_id}")
+        return {
+            'success': False,
+            'error': f"Document {document_id} not found"
+        }
+        
+    except Exception as exc:
+        logger.error(f"PDF split task failed for job {job_id}: {str(exc)}")
+        
+        # Update job status
+        try:
+            job = ProcessingJob.objects.get(id=job_id)
+            job.status = 'failed'
+            job.error_messages = str(exc)
+            job.save()
+        except ProcessingJob.DoesNotExist:
+            pass
+        
+        if self.request.retries < self.max_retries:
+            logger.info(f"Retrying split task for job {job_id} (attempt {self.request.retries + 1})")
+            raise self.retry(countdown=180 * (2 ** self.request.retries), exc=exc)
+        
+        return {
+            'success': False,
+            'job_id': job_id,
+            'error': str(exc),
+            'retries': self.request.retries
+        }
+
+
+@shared_task(bind=True, max_retries=2, default_retry_delay=240)
+def process_pdf_merge(self, document_ids: List[str], job_id: str, merge_params: Dict[str, Any]) -> Dict[str, Any]:
+    """Process PDF merging operations in the background.
+    
+    Args:
+        document_ids: List of document UUIDs to merge
+        job_id: Processing job UUID
+        merge_params: Merge parameters
+        
+    Returns:
+        Dictionary with merge processing results
+    """
+    try:
+        # Get the processing job
+        job = ProcessingJob.objects.get(id=job_id)
+        job.status = 'processing'
+        job.progress = 10
+        job.save()
+        
+        logger.info(f"Starting PDF merge for job {job_id} with {len(document_ids)} documents")
+        
+        # Get all documents and validate they exist
+        documents = []
+        file_paths = []
+        
+        for doc_id in document_ids:
+            try:
+                doc = PDFDocument.objects.get(id=doc_id)
+                documents.append(doc)
+                
+                doc_path = TempFileManager.get_session_path(
+                    doc.session_id, 'uploads'
+                ) / doc.filename
+                
+                if not doc_path.exists():
+                    raise FileNotFoundError(f"Document file not found: {doc_path}")
+                
+                file_paths.append(doc_path)
+                
+            except PDFDocument.DoesNotExist:
+                raise ValueError(f"Document not found: {doc_id}")
+        
+        # Use session from first document for processor
+        session_id = documents[0].session_id
+        processor = PDFProcessor(session_id)
+        
+        job.progress = 25
+        job.save()
+        
+        # Perform merge operation
+        result = processor.merge_pdfs(
+            file_paths,
+            output_filename=merge_params.get('output_filename'),
+            preserve_metadata=merge_params.get('preserve_metadata', True),
+            merge_strategy=merge_params.get('merge_strategy', 'sequential')
+        )
+        
+        job.progress = 75
+        job.save()
+        
+        if result['success']:
+            job.status = 'completed'
+            job.progress = 100
+            job.results = {
+                'output_file': result['output_file'],
+                'total_pages': result['total_pages'],
+                'source_count': len(file_paths),
+                'source_files': [doc.filename for doc in documents],
+                'merge_strategy': result.get('merge_strategy', 'sequential'),
+                'metadata_preserved': result.get('metadata_preserved', True),
+                'statistics': result.get('statistics', {})
+            }
+            
+            logger.info(f"Successfully completed PDF merge for job {job_id}: {result['total_pages']} total pages")
+        else:
+            job.status = 'failed'
+            job.error_messages = result.get('error', 'Unknown merge error')
+            logger.error(f"PDF merge failed for job {job_id}: {job.error_messages}")
+        
+        job.save()
+        
+        # Schedule cleanup after processing
+        TempFileManager.schedule_cleanup(session_id)
+        
+        return {
+            'success': result['success'],
+            'job_id': job_id,
+            'document_ids': document_ids,
+            'result': result
+        }
+        
+    except ProcessingJob.DoesNotExist:
+        logger.error(f"Processing job not found: {job_id}")
+        return {
+            'success': False,
+            'error': f"Job {job_id} not found"
+        }
+        
+    except Exception as exc:
+        logger.error(f"PDF merge task failed for job {job_id}: {str(exc)}")
+        
+        # Update job status
+        try:
+            job = ProcessingJob.objects.get(id=job_id)
+            job.status = 'failed'
+            job.error_messages = str(exc)
+            job.save()
+        except ProcessingJob.DoesNotExist:
+            pass
+        
+        if self.request.retries < self.max_retries:
+            logger.info(f"Retrying merge task for job {job_id} (attempt {self.request.retries + 1})")
+            raise self.retry(countdown=240 * (2 ** self.request.retries), exc=exc)
+        
+        return {
+            'success': False,
+            'job_id': job_id,
+            'error': str(exc),
+            'retries': self.request.retries
+        }
+
+
+@shared_task(bind=True, max_retries=1, default_retry_delay=60)
+def process_pdf_extraction(
+    self, 
+    document_id: str, 
+    job_id: str, 
+    extraction_type: str, 
+    page_range: List[int] = None
+) -> Dict[str, Any]:
+    """Process PDF text/metadata/image extraction in the background.
+    
+    Args:
+        document_id: UUID of the document to process
+        job_id: Processing job UUID
+        extraction_type: Type of extraction ('text', 'metadata', 'images', 'comprehensive')
+        page_range: Optional page range to limit extraction
+        
+    Returns:
+        Dictionary with extraction processing results
+    """
+    try:
+        # Get the processing job and document
+        job = ProcessingJob.objects.get(id=job_id)
+        document = PDFDocument.objects.get(id=document_id)
+        
+        job.status = 'processing'
+        job.progress = 10
+        job.save()
+        
+        logger.info(f"Starting PDF extraction ({extraction_type}) for job {job_id}, document {document.filename}")
+        
+        # Get file path
+        upload_path = TempFileManager.get_session_path(document.session_id, 'uploads')
+        pdf_file = upload_path / document.filename
+        
+        if not pdf_file.exists():
+            raise FileNotFoundError(f"PDF file not found: {pdf_file}")
+        
+        # Initialize PDF processor
+        processor = PDFProcessor(document.session_id)
+        
+        job.progress = 25
+        job.save()
+        
+        # Perform extraction based on type
+        if extraction_type == 'text':
+            result = processor.extract_text(pdf_file)
+        elif extraction_type == 'metadata':
+            result = processor.extract_advanced_metadata(pdf_file)
+        elif extraction_type == 'images':
+            result = processor.extract_embedded_files(pdf_file)
+        elif extraction_type == 'comprehensive':
+            # Perform all extractions
+            text_result = processor.extract_text(pdf_file)
+            metadata_result = processor.extract_advanced_metadata(pdf_file)
+            files_result = processor.extract_embedded_files(pdf_file)
+            
+            result = {
+                'success': text_result['success'] and metadata_result['success'],
+                'text_extraction': text_result,
+                'metadata_extraction': metadata_result,
+                'files_extraction': files_result
+            }
+        else:
+            raise ValueError(f"Unknown extraction type: {extraction_type}")
+        
+        job.progress = 75
+        job.save()
+        
+        if result['success']:
+            job.status = 'completed'
+            job.progress = 100
+            job.results = {
+                'extraction_type': extraction_type,
+                'result': result
+            }
+            
+            logger.info(f"Successfully completed PDF extraction ({extraction_type}) for job {job_id}")
+        else:
+            job.status = 'failed'
+            job.error_messages = result.get('error', f'Unknown {extraction_type} extraction error')
+            logger.error(f"PDF extraction ({extraction_type}) failed for job {job_id}: {job.error_messages}")
+        
+        job.save()
+        
+        # Schedule cleanup after processing
+        TempFileManager.schedule_cleanup(document.session_id)
+        
+        return {
+            'success': result['success'],
+            'job_id': job_id,
+            'document_id': document_id,
+            'extraction_type': extraction_type,
+            'result': result
+        }
+        
+    except ProcessingJob.DoesNotExist:
+        logger.error(f"Processing job not found: {job_id}")
+        return {
+            'success': False,
+            'error': f"Job {job_id} not found"
+        }
+        
+    except PDFDocument.DoesNotExist:
+        logger.error(f"Document not found: {document_id}")
+        return {
+            'success': False,
+            'error': f"Document {document_id} not found"
+        }
+        
+    except Exception as exc:
+        logger.error(f"PDF extraction task failed for job {job_id}: {str(exc)}")
+        
+        # Update job status
+        try:
+            job = ProcessingJob.objects.get(id=job_id)
+            job.status = 'failed'
+            job.error_messages = str(exc)
+            job.save()
+        except ProcessingJob.DoesNotExist:
+            pass
+        
+        if self.request.retries < self.max_retries:
+            logger.info(f"Retrying extraction task for job {job_id} (attempt {self.request.retries + 1})")
+            raise self.retry(countdown=60 * (2 ** self.request.retries), exc=exc)
         
         return {
             'success': False,

@@ -3,7 +3,7 @@
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework import status
-from django.http import JsonResponse
+from django.http import JsonResponse, FileResponse
 from django.views.decorators.csrf import csrf_exempt
 from django.utils.decorators import method_decorator
 from django.utils.text import get_valid_filename
@@ -12,9 +12,10 @@ from django.utils import timezone
 from datetime import timedelta
 from pathlib import Path
 import logging
+import os
 
 from .models import PDFDocument, ProcessingJob
-from .utils.validators import validate_pdf_file, validate_session_id
+from .utils.validators import validate_pdf_file, validate_session_id, validate_split_pattern, validate_merge_parameters
 from .utils.errors import APIError, ERROR_MAPPINGS, ValidationError
 from .services.temp_file_manager import TempFileManager
 from .services.pdf_processor import PDFProcessor
@@ -511,13 +512,43 @@ class RedactionPreviewView(APIView):
 
 
 class SplitAPIView(APIView):
-    """Handle PDF splitting requests."""
+    """Handle PDF splitting requests with pattern-based and page-based splitting."""
+    
+    def _estimate_processing_time(self, file_size: int, page_count: int, split_type: str) -> dict:
+        """Estimate processing time for split operations."""
+        base_time = 5  # seconds
+        size_factor = file_size / (1024 * 1024)  # MB
+        page_factor = page_count * 0.5  # 0.5 seconds per page
+        
+        if split_type == 'pattern':
+            # Pattern-based splitting requires text extraction
+            pattern_overhead = page_count * 2  # Extra time for pattern detection
+            estimated_seconds = int(base_time + size_factor + page_factor + pattern_overhead)
+        else:
+            estimated_seconds = int(base_time + size_factor + page_factor)
+        
+        return {
+            'estimated_seconds': estimated_seconds,
+            'estimated_minutes': round(estimated_seconds / 60, 1)
+        }
     
     def post(self, request):
-        """Start PDF splitting process."""
+        """Start PDF splitting process with pattern-based or page-based splitting."""
         try:
             document_id = request.data.get('document_id')
+            split_strategy = request.data.get('split_strategy', 'pages')
+            
+            # Pattern-based splitting parameters
+            pattern = request.data.get('pattern')
+            pattern_type = request.data.get('pattern_type', 'regex')
+            fuzzy_threshold = request.data.get('fuzzy_threshold', 80)
+            split_position = request.data.get('split_position', 'before')
+            
+            # Page-based splitting parameters
             split_pages = request.data.get('split_pages', [])
+            
+            # Common parameters
+            preserve_metadata = request.data.get('preserve_metadata', True)
             
             if not document_id:
                 raise APIError(
@@ -526,21 +557,15 @@ class SplitAPIView(APIView):
                     status.HTTP_400_BAD_REQUEST
                 )
             
-            document = PDFDocument.objects.get(id=document_id)
-            
-            # Create processing job
-            job = ProcessingJob.objects.create(
-                document=document,
-                job_type='split'
-            )
-            
-            # Validate split pages
-            if split_pages and not all(isinstance(p, int) and p > 0 for p in split_pages):
+            # Validate split strategy
+            if split_strategy not in ['pages', 'pattern']:
                 raise APIError(
-                    "Split pages must be positive integers",
-                    "INVALID_SPLIT_PAGES",
+                    "Split strategy must be 'pages' or 'pattern'",
+                    "INVALID_SPLIT_STRATEGY",
                     status.HTTP_400_BAD_REQUEST
                 )
+            
+            document = PDFDocument.objects.get(id=document_id)
             
             # Initialize PDF processor and validate document
             pdf_processor = PDFProcessor(document.session_id)
@@ -562,27 +587,107 @@ class SplitAPIView(APIView):
                     status.HTTP_400_BAD_REQUEST
                 )
             
-            # Validate split points against page count
             max_page = pdf_info.get('page_count', 1)
-            if split_pages and max(split_pages) > max_page:
-                raise APIError(
-                    f"Split page {max(split_pages)} exceeds document page count ({max_page})",
-                    "INVALID_PAGE_NUMBER",
-                    status.HTTP_400_BAD_REQUEST
-                )
             
-            # Update job with processing parameters
-            job.processing_parameters = {
-                'split_pages': split_pages,
+            # Validate parameters based on split strategy
+            if split_strategy == 'pattern':
+                if not pattern:
+                    raise APIError(
+                        "Pattern is required for pattern-based splitting",
+                        "MISSING_PATTERN",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Validate pattern
+                pattern_validation = validate_split_pattern(pattern, pattern_type)
+                if not pattern_validation['valid']:
+                    raise APIError(
+                        f"Invalid pattern: {pattern_validation['error']}",
+                        "INVALID_PATTERN",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Validate fuzzy threshold
+                if not (1 <= fuzzy_threshold <= 100):
+                    raise APIError(
+                        "Fuzzy threshold must be between 1 and 100",
+                        "INVALID_FUZZY_THRESHOLD",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Validate split position
+                if split_position not in ['before', 'after']:
+                    raise APIError(
+                        "Split position must be 'before' or 'after'",
+                        "INVALID_SPLIT_POSITION",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Test pattern against document
+                pattern_test = pdf_processor.validate_split_pattern(file_path, pattern, pattern_type)
+                if not pattern_test['valid']:
+                    raise APIError(
+                        f"Pattern validation failed: {pattern_test['error']}",
+                        "PATTERN_TEST_FAILED",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                estimated_output_files = pattern_test.get('test_matches', 1) + 1
+                
+            else:  # pages strategy
+                if not split_pages:
+                    raise APIError(
+                        "Split pages are required for page-based splitting",
+                        "MISSING_SPLIT_PAGES",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Validate split pages
+                if not all(isinstance(p, int) and p > 0 for p in split_pages):
+                    raise APIError(
+                        "Split pages must be positive integers",
+                        "INVALID_SPLIT_PAGES",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                # Validate split points against page count
+                if max(split_pages) > max_page:
+                    raise APIError(
+                        f"Split page {max(split_pages)} exceeds document page count ({max_page})",
+                        "INVALID_PAGE_NUMBER",
+                        status.HTTP_400_BAD_REQUEST
+                    )
+                
+                estimated_output_files = len(split_pages) + 1
+            
+            # Create processing job with comprehensive parameters
+            split_params = {
+                'split_strategy': split_strategy,
+                'preserve_metadata': preserve_metadata,
                 'document_path': str(file_path),
                 'total_pages': max_page
             }
-            job.save()
+            
+            if split_strategy == 'pattern':
+                split_params.update({
+                    'pattern': pattern,
+                    'pattern_type': pattern_type,
+                    'fuzzy_threshold': fuzzy_threshold,
+                    'split_position': split_position
+                })
+            else:
+                split_params['split_pages'] = split_pages
+            
+            job = ProcessingJob.objects.create(
+                document=document,
+                job_type='split',
+                processing_parameters=split_params
+            )
             
             # Queue background task for processing
             try:
                 from tasks import process_pdf_split
-                process_pdf_split.delay(str(document.id), str(job.id), split_pages)
+                process_pdf_split.delay(str(document.id), str(job.id), split_params)
                 job.status = 'queued'
                 job.save()
             except ImportError:
@@ -590,17 +695,38 @@ class SplitAPIView(APIView):
                 job.status = 'pending'
                 job.save()
             
-            return Response({
+            # Calculate processing time estimate
+            processing_estimate = self._estimate_processing_time(
+                document.file_size, max_page, split_strategy
+            )
+            
+            response_data = {
                 'success': True,
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': 'Split job queued for processing',
-                'document_info': {
+                'message': f'{split_strategy.title()}-based split job queued for processing',
+                'split_info': {
+                    'strategy': split_strategy,
                     'total_pages': max_page,
-                    'split_pages': split_pages or [],
-                    'estimated_output_files': len(split_pages) + 1 if split_pages else 1
+                    'estimated_output_files': estimated_output_files,
+                    'preserve_metadata': preserve_metadata,
+                    'processing_estimate': processing_estimate
                 }
-            })
+            }
+            
+            # Add strategy-specific info to response
+            if split_strategy == 'pattern':
+                response_data['split_info']['pattern_info'] = {
+                    'pattern': pattern,
+                    'pattern_type': pattern_type,
+                    'fuzzy_threshold': fuzzy_threshold,
+                    'split_position': split_position,
+                    'test_matches_found': pattern_test.get('test_matches', 0)
+                }
+            else:
+                response_data['split_info']['split_pages'] = split_pages
+            
+            return Response(response_data)
             
         except PDFDocument.DoesNotExist:
             return Response(
@@ -616,18 +742,44 @@ class SplitAPIView(APIView):
 
 
 class MergeAPIView(APIView):
-    """Handle PDF merging requests with comprehensive validation."""
+    """Handle PDF merging requests with enhanced metadata preservation and validation."""
+    
+    def _estimate_processing_time(self, total_size: int, total_pages: int, document_count: int) -> dict:
+        """Estimate processing time for merge operations."""
+        base_time = 5  # seconds
+        size_factor = total_size / (1024 * 1024)  # MB
+        page_factor = total_pages * 0.3  # 0.3 seconds per page
+        document_factor = document_count * 2  # 2 seconds per document
+        
+        estimated_seconds = int(base_time + size_factor + page_factor + document_factor)
+        
+        return {
+            'estimated_seconds': estimated_seconds,
+            'estimated_minutes': round(estimated_seconds / 60, 1)
+        }
     
     def post(self, request):
-        """Start PDF merging process."""
+        """Start PDF merging process with enhanced parameters."""
         try:
             document_ids = request.data.get('document_ids', [])
             output_filename = request.data.get('output_filename', None)
+            preserve_metadata = request.data.get('preserve_metadata', True)
+            merge_strategy = request.data.get('merge_strategy', 'sequential')
+            custom_order = request.data.get('custom_order', None)
             
             if not document_ids or len(document_ids) < 2:
                 raise APIError(
                     "At least two document IDs are required", 
                     "MISSING_PARAMETERS", 
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Validate merge parameters
+            merge_validation = validate_merge_parameters(document_ids, merge_strategy, custom_order)
+            if not merge_validation['valid']:
+                raise APIError(
+                    f"Invalid merge parameters: {merge_validation['error']}",
+                    "INVALID_MERGE_PARAMETERS",
                     status.HTTP_400_BAD_REQUEST
                 )
             
@@ -689,10 +841,34 @@ class MergeAPIView(APIView):
                 }
             )
             
+            # Validate total combined file size
+            if total_size > 100 * 1024 * 1024:  # 100MB limit
+                raise APIError(
+                    f"Total file size ({round(total_size/(1024*1024), 2)}MB) exceeds 100MB limit",
+                    "FILE_SIZE_LIMIT_EXCEEDED",
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Create comprehensive merge parameters
+            merge_params = {
+                'document_ids': document_ids,
+                'output_filename': output_filename,
+                'preserve_metadata': preserve_metadata,
+                'merge_strategy': merge_strategy,
+                'custom_order': custom_order,
+                'document_info': document_info,
+                'total_pages': total_pages,
+                'total_size': total_size
+            }
+            
+            # Update job with enhanced parameters
+            job.processing_parameters = merge_params
+            job.save()
+            
             # Queue background task for processing
             try:
                 from tasks import process_pdf_merge
-                process_pdf_merge.delay(document_ids, str(job.id), output_filename)
+                process_pdf_merge.delay(document_ids, str(job.id), merge_params)
                 job.status = 'queued'
                 job.save()
             except ImportError:
@@ -700,17 +876,24 @@ class MergeAPIView(APIView):
                 job.status = 'pending'
                 job.save()
             
+            # Calculate processing time estimate
+            processing_estimate = self._estimate_processing_time(total_size, total_pages, len(documents))
+            
             return Response({
                 'success': True,
                 'job_id': str(job.id),
                 'status': job.status,
-                'message': 'Merge job queued for processing',
+                'message': 'Enhanced merge job queued for processing',
                 'merge_info': {
                     'total_documents': len(documents),
                     'total_pages': total_pages,
                     'total_size_mb': round(total_size / (1024 * 1024), 2),
+                    'merge_strategy': merge_strategy,
+                    'preserve_metadata': preserve_metadata,
+                    'processing_estimate': processing_estimate,
                     'document_list': document_info,
-                    'output_filename': output_filename
+                    'output_filename': output_filename,
+                    'custom_order': custom_order if merge_strategy == 'custom' else None
                 }
             })
             
@@ -941,6 +1124,65 @@ class JobStatusView(APIView):
             )
         except Exception as e:
             logger.error(f"Status check error: {str(e)}")
+            return Response(
+                ERROR_MAPPINGS['SERVER_ERROR'].to_dict(),
+                status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            )
+
+
+class RedactionDownloadView(APIView):
+    """Handle redacted PDF downloads."""
+    
+    def get(self, request, job_id):
+        """Download the redacted PDF file."""
+        try:
+            job = ProcessingJob.objects.get(id=job_id)
+            
+            # Validate job is completed
+            if job.status != 'completed':
+                raise APIError(
+                    f"Job is not completed. Current status: {job.status}",
+                    "JOB_NOT_COMPLETED",
+                    status.HTTP_400_BAD_REQUEST
+                )
+            
+            # Check if results contain output_path
+            if not job.results or not job.results.get('output_path'):
+                raise APIError(
+                    "No output file available for download",
+                    "NO_OUTPUT_FILE",
+                    status.HTTP_404_NOT_FOUND
+                )
+            
+            output_path = job.results['output_path']
+            
+            # Verify file exists
+            if not os.path.exists(output_path):
+                raise APIError(
+                    "Output file not found on disk",
+                    "FILE_NOT_FOUND",
+                    status.HTTP_404_NOT_FOUND
+                )
+            
+            # Get filename for download
+            filename = os.path.basename(output_path)
+            
+            # Return file as download
+            return FileResponse(
+                open(output_path, 'rb'),
+                as_attachment=True,
+                filename=filename
+            )
+            
+        except ProcessingJob.DoesNotExist:
+            return Response(
+                ERROR_MAPPINGS['JOB_NOT_FOUND'].to_dict(),
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except APIError as e:
+            return Response(e.to_dict(), status=e.status)
+        except Exception as e:
+            logger.error(f"Download error: {str(e)}")
             return Response(
                 ERROR_MAPPINGS['SERVER_ERROR'].to_dict(),
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
