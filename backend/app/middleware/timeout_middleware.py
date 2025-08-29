@@ -171,7 +171,7 @@ class TimeoutHandlerMiddleware(MiddlewareMixin):
             return True
             
         # Check file size indicators that suggest long processing time
-        content_length = int(request.META.get('CONTENT_LENGTH', 0))
+        content_length = int(request.META.get('CONTENT_LENGTH') or 0)
         if content_length > 50 * 1024 * 1024:  # 50MB threshold
             return True
             
@@ -198,7 +198,7 @@ class TimeoutHandlerMiddleware(MiddlewareMixin):
             content_type = request.META.get('CONTENT_TYPE', '')
             if 'multipart/form-data' in content_type:
                 # Rough estimation based on content length and boundaries
-                content_length = int(request.META.get('CONTENT_LENGTH', 0))
+                content_length = int(request.META.get('CONTENT_LENGTH') or 0)
                 # Assume average file size of 5MB for estimation
                 return max(1, content_length // (5 * 1024 * 1024))
         except:
@@ -298,7 +298,7 @@ class TimeoutHandlerMiddleware(MiddlewareMixin):
         base_time = 5.0  # Base processing time
         
         # Adjust based on file size
-        content_length = int(request.META.get('CONTENT_LENGTH', 0))
+        content_length = int(request.META.get('CONTENT_LENGTH') or 0)
         file_size_factor = content_length / (1024 * 1024)  # Size in MB
         
         # Adjust based on operation type

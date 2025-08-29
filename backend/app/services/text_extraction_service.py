@@ -10,7 +10,6 @@ import json
 
 from django.core.cache import cache
 
-from .pdf_processor import PDFProcessor
 from .ocr_service import OCRService
 from app.utils.temp_file_manager import TempFileManager
 
@@ -53,16 +52,21 @@ class TextExtractionService:
     CACHE_TIMEOUT = 3600  # 1 hour
     CACHE_PREFIX = "text_extraction"
     
-    def __init__(self, session_id: str, pdf_processor: Optional[PDFProcessor] = None, ocr_service: Optional[OCRService] = None):
+    def __init__(self, session_id: str, pdf_processor: Optional[Any] = None, ocr_service: Optional[OCRService] = None):
         """Initialize text extraction service.
         
         Args:
             session_id: Session identifier for file management
-            pdf_processor: Optional PDFProcessor instance for dependency injection
+            pdf_processor: Optional PDF processor instance for dependency injection
             ocr_service: Optional OCRService instance for dependency injection
         """
         self.session_id = session_id
-        self.pdf_processor = pdf_processor or PDFProcessor(session_id)
+        if pdf_processor:
+            self.pdf_processor = pdf_processor
+        else:
+            # Import here to avoid circular dependency
+            from .pdf_processor import PDFProcessor
+            self.pdf_processor = PDFProcessor(session_id)
         self.ocr_service = ocr_service or OCRService()
         self.temp_file_manager = TempFileManager(session_id)
         

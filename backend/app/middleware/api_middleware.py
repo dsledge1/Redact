@@ -148,27 +148,9 @@ class APIResponseMiddleware(MiddlewareMixin):
             )
         
         # Handle CORS for API endpoints
-        # Let django-cors-headers handle CORS to avoid conflicts with credentials settings
-        # Only add API-specific exposed headers if not handled by django-cors-headers
-        if not response.get('Access-Control-Allow-Origin'):
-            origin = request.META.get('HTTP_ORIGIN')
-            allowed_origins = getattr(settings, 'CORS_ALLOWED_ORIGINS', [])
-            allow_credentials = getattr(settings, 'CORS_ALLOW_CREDENTIALS', False)
-            
-            # Only set CORS headers if django-cors-headers didn't handle them
-            if request.method == 'OPTIONS' and origin:
-                if not allow_credentials:
-                    # Can use * when credentials are not allowed
-                    response['Access-Control-Allow-Origin'] = '*'
-                elif origin in allowed_origins:
-                    # Use specific origin when credentials are allowed
-                    response['Access-Control-Allow-Origin'] = origin
-                    response['Access-Control-Allow-Credentials'] = 'true'
-                    
-                response['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS'
-                response['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, X-Session-ID'
-                
-            # Always expose API-specific headers regardless of who handles CORS
+        # Let django-cors-headers handle CORS completely
+        # We only need to ensure expose headers are set if not already present
+        if not response.get('Access-Control-Expose-Headers'):
             response['Access-Control-Expose-Headers'] = 'X-Request-ID, X-Processing-Time, X-Timeout-Warning'
             
         # Compress large responses if enabled

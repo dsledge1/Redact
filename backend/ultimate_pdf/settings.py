@@ -108,11 +108,11 @@ CELERY_TASK_SERIALIZER = 'json'
 CELERY_RESULT_SERIALIZER = 'json'
 CELERY_TIMEZONE = TIME_ZONE
 
-# Redis Configuration
+# Cache Configuration (using local memory instead of Redis for development)
 CACHES = {
     'default': {
-        'BACKEND': 'django.core.cache.backends.redis.RedisCache',
-        'LOCATION': 'redis://127.0.0.1:6379/1',
+        'BACKEND': 'django.core.cache.backends.locmem.LocMemCache',
+        'LOCATION': 'unique-snowflake',
     }
 }
 
@@ -131,7 +131,7 @@ CORS_ALLOWED_ORIGINS = [
 ]
 CORS_ALLOW_CREDENTIALS = True
 CORS_EXPOSE_HEADERS = ['X-Request-ID', 'X-Processing-Time', 'X-Timeout-Warning']
-CORS_ALLOWED_HEADERS = [
+CORS_ALLOW_HEADERS = [
     'accept',
     'accept-encoding',
     'authorization',

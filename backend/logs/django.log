@@ -1,0 +1,201 @@
+INFO 2025-08-28 21:00:02,438 autoreload 305231 139122973724800 Watching for file changes with StatReloader
+ERROR 2025-08-28 21:00:52,018 log 305231 139122849085120 Internal Server Error: /api/health/
+Traceback (most recent call last):
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 264, in connect
+    sock = self.retry.call_with_retry(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/retry.py", line 46, in call_with_retry
+    return do()
+           ^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 265, in <lambda>
+    lambda: self._connect(), lambda error: self.disconnect(error)
+            ^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 627, in _connect
+    raise err
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 615, in _connect
+    sock.connect(socket_address)
+ConnectionRefusedError: [Errno 111] Connection refused
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/handlers/exception.py", line 55, in inner
+    response = get_response(request)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/utils/deprecation.py", line 119, in __call__
+    response = self.process_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/api_middleware.py", line 301, in process_request
+    current_requests = cache.get(cache_key, 0)
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/cache/backends/redis.py", line 188, in get
+    return self._cache.get(key, default)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/cache/backends/redis.py", line 100, in get
+    value = client.get(key)
+            ^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/commands/core.py", line 1829, in get
+    return self.execute_command("GET", name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/client.py", line 533, in execute_command
+    conn = self.connection or pool.get_connection(command_name, **options)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 1086, in get_connection
+    connection.connect()
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 270, in connect
+    raise ConnectionError(self._error_message(e))
+redis.exceptions.ConnectionError: Error 111 connecting to 127.0.0.1:6379. Connection refused.
+ERROR 2025-08-28 21:00:52,040 basehttp 305231 139122849085120 "GET /api/health/ HTTP/1.1" 500 122944
+WARNING 2025-08-28 21:00:52,768 log 305231 139122849085120 Not Found: /favicon.ico
+WARNING 2025-08-28 21:00:52,769 basehttp 305231 139122849085120 "GET /favicon.ico HTTP/1.1" 404 2700
+INFO 2025-08-28 21:00:57,018 basehttp 305231 139122849085120 "GET /admin/login/?next=/admin/ HTTP/1.1" 200 4173
+INFO 2025-08-28 21:03:53,345 basehttp 305231 139122849085120 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-28 21:03:57,476 basehttp 305231 139122849085120 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-28 21:05:03,618 autoreload 305231 139122973724800 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/urls.py changed, reloading.
+INFO 2025-08-28 21:05:03,975 autoreload 308690 134789302423680 Watching for file changes with StatReloader
+INFO 2025-08-28 21:05:16,480 autoreload 308690 134789302423680 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/urls.py changed, reloading.
+INFO 2025-08-28 21:05:16,797 autoreload 308879 126569699844224 Watching for file changes with StatReloader
+ERROR 2025-08-28 21:05:26,789 log 308879 126569649862336 Internal Server Error: /api/health/
+Traceback (most recent call last):
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 264, in connect
+    sock = self.retry.call_with_retry(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/retry.py", line 46, in call_with_retry
+    return do()
+           ^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 265, in <lambda>
+    lambda: self._connect(), lambda error: self.disconnect(error)
+            ^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 627, in _connect
+    raise err
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 615, in _connect
+    sock.connect(socket_address)
+ConnectionRefusedError: [Errno 111] Connection refused
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/handlers/exception.py", line 55, in inner
+    response = get_response(request)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/utils/deprecation.py", line 119, in __call__
+    response = self.process_request(request)
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/api_middleware.py", line 301, in process_request
+    current_requests = cache.get(cache_key, 0)
+                       ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/cache/backends/redis.py", line 188, in get
+    return self._cache.get(key, default)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/cache/backends/redis.py", line 100, in get
+    value = client.get(key)
+            ^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/commands/core.py", line 1829, in get
+    return self.execute_command("GET", name)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/client.py", line 533, in execute_command
+    conn = self.connection or pool.get_connection(command_name, **options)
+                              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 1086, in get_connection
+    connection.connect()
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/redis/connection.py", line 270, in connect
+    raise ConnectionError(self._error_message(e))
+redis.exceptions.ConnectionError: Error 111 connecting to 127.0.0.1:6379. Connection refused.
+ERROR 2025-08-28 21:05:26,791 basehttp 308879 126569649862336 "GET /api/health/ HTTP/1.1" 500 120985
+INFO 2025-08-28 21:05:50,128 autoreload 308879 126569699844224 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/ultimate_pdf/settings.py changed, reloading.
+INFO 2025-08-28 21:05:50,502 autoreload 309360 130189589926016 Watching for file changes with StatReloader
+INFO 2025-08-28 21:06:04,823 autoreload 309512 127561047429248 Watching for file changes with StatReloader
+ERROR 2025-08-28 21:06:15,929 log 309512 127560930293440 Internal Server Error: /api/health/
+Traceback (most recent call last):
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/handlers/exception.py", line 55, in inner
+    response = get_response(request)
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/venv/lib/python3.12/site-packages/django/core/handlers/base.py", line 185, in _get_response
+    response = middleware_method(
+               ^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/timeout_middleware.py", line 83, in process_view
+    if self._should_queue_background_task(request):
+       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/timeout_middleware.py", line 174, in _should_queue_background_task
+    content_length = int(request.META.get('CONTENT_LENGTH', 0))
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+ValueError: invalid literal for int() with base 10: ''
+ERROR 2025-08-28 21:06:15,930 basehttp 309512 127560930293440 "GET /api/health/ HTTP/1.1" 500 76524
+INFO 2025-08-28 21:07:17,804 autoreload 309512 127561047429248 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/timeout_middleware.py changed, reloading.
+INFO 2025-08-28 21:07:18,166 autoreload 310283 131102510813312 Watching for file changes with StatReloader
+INFO 2025-08-28 21:07:21,501 autoreload 310283 131102510813312 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/timeout_middleware.py changed, reloading.
+INFO 2025-08-28 21:07:21,812 autoreload 310329 126457167339648 Watching for file changes with StatReloader
+INFO 2025-08-28 21:07:25,178 autoreload 310329 126457167339648 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/timeout_middleware.py changed, reloading.
+INFO 2025-08-28 21:07:25,513 autoreload 310347 138322594005120 Watching for file changes with StatReloader
+INFO 2025-08-28 21:07:32,541 basehttp 310347 138322544019136 "GET /api/health/ HTTP/1.1" 200 45
+INFO 2025-08-28 22:26:02,957 basehttp 310347 138322544019136 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-28 22:26:52,999 basehttp 310347 138322544019136 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-28 22:27:14,204 basehttp 310347 138322526185152 "POST /api/redact/ HTTP/1.1" 200 104
+INFO 2025-08-28 22:27:14,204 basehttp 310347 138322526185152 code 400, message Bad request syntax ('13f')
+WARNING 2025-08-28 22:27:14,204 basehttp 310347 138322526185152 "13f" 400 -
+INFO 2025-08-28 22:27:18,952 basehttp 310347 138322526185152 "OPTIONS /api/redact/ HTTP/1.1" 200 0
+WARNING 2025-08-28 22:27:59,407 log 310347 138322534577856 Bad Request: /api/upload/
+WARNING 2025-08-28 22:27:59,407 basehttp 310347 138322534577856 "POST /api/upload/ HTTP/1.1" 400 47
+INFO 2025-08-28 22:27:59,407 basehttp 310347 138322534577856 code 400, message Bad request syntax ('d0')
+WARNING 2025-08-28 22:27:59,408 basehttp 310347 138322534577856 "d0" 400 -
+INFO 2025-08-29 03:18:21,601 basehttp 310347 138322544019136 "POST /api/upload/ HTTP/1.1" 200 193
+INFO 2025-08-29 03:18:27,592 basehttp 310347 138322544019136 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:23:09,942 basehttp 310347 138322544019136 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:26:17,227 basehttp 310347 138322544019136 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:27:40,052 autoreload 310347 138322594005120 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/api_middleware.py changed, reloading.
+INFO 2025-08-29 03:27:41,146 autoreload 323886 128179213447296 Watching for file changes with StatReloader
+INFO 2025-08-29 03:28:09,963 autoreload 323886 128179213447296 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/middleware/api_middleware.py changed, reloading.
+INFO 2025-08-29 03:28:10,435 autoreload 324133 124489811222656 Watching for file changes with StatReloader
+INFO 2025-08-29 03:28:21,918 basehttp 324133 124489693132480 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:28:40,286 basehttp 324133 124489693132480 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:31:09,608 autoreload 324133 124489811222656 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/ultimate_pdf/settings.py changed, reloading.
+INFO 2025-08-29 03:31:09,976 autoreload 325580 135212273963136 Watching for file changes with StatReloader
+INFO 2025-08-29 03:31:18,918 basehttp 325580 135212223960768 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:31:56,519 basehttp 325580 135212223960768 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:31:56,845 basehttp 325580 135212138751680 "POST /api/upload/ HTTP/1.1" 200 199
+INFO 2025-08-29 03:32:01,950 basehttp 325580 135212138751680 "POST /api/upload/ HTTP/1.1" 200 200
+INFO 2025-08-29 03:32:16,743 basehttp 325580 135212138751680 "POST /api/upload/ HTTP/1.1" 200 199
+INFO 2025-08-29 03:32:29,622 basehttp 325580 135212138751680 "POST /api/upload/ HTTP/1.1" 200 199
+INFO 2025-08-29 03:33:57,283 autoreload 325580 135212273963136 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/views_simple.py changed, reloading.
+INFO 2025-08-29 03:33:57,627 autoreload 327479 132355618558080 Watching for file changes with StatReloader
+INFO 2025-08-29 03:34:09,219 autoreload 327479 132355618558080 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/views_simple.py changed, reloading.
+INFO 2025-08-29 03:34:09,613 autoreload 327569 130429063504000 Watching for file changes with StatReloader
+INFO 2025-08-29 03:35:08,401 basehttp 327569 130429013522112 "POST /api/upload/ HTTP/1.1" 200 214
+INFO 2025-08-29 03:35:29,846 basehttp 327569 130429013522112 "POST /api/upload/ HTTP/1.1" 200 237
+INFO 2025-08-29 03:35:30,180 basehttp 327569 130428996736704 "OPTIONS /api/documents/ceafd19a-a694-49ba-89fb-f9d2da9df0a8/ HTTP/1.1" 200 0
+WARNING 2025-08-29 03:35:30,199 log 327569 130429013522112 Not Found: /api/documents/ceafd19a-a694-49ba-89fb-f9d2da9df0a8/
+WARNING 2025-08-29 03:35:30,200 basehttp 327569 130429013522112 "GET /api/documents/ceafd19a-a694-49ba-89fb-f9d2da9df0a8/ HTTP/1.1" 404 1229
+INFO 2025-08-29 03:37:38,050 basehttp 327569 130429013522112 "POST /api/upload/ HTTP/1.1" 200 237
+INFO 2025-08-29 03:37:38,056 basehttp 327569 130428996736704 "OPTIONS /api/documents/a0177d74-61de-4650-9b61-ff22481dc5e0/ HTTP/1.1" 200 0
+WARNING 2025-08-29 03:37:38,061 log 327569 130429013522112 Not Found: /api/documents/a0177d74-61de-4650-9b61-ff22481dc5e0/
+WARNING 2025-08-29 03:37:38,061 basehttp 327569 130429013522112 "GET /api/documents/a0177d74-61de-4650-9b61-ff22481dc5e0/ HTTP/1.1" 404 1230
+INFO 2025-08-29 03:38:07,281 basehttp 327569 130429013522112 "POST /api/upload/ HTTP/1.1" 200 237
+INFO 2025-08-29 03:38:07,287 basehttp 327569 130428996736704 "OPTIONS /api/documents/e75df3b9-df84-40aa-8897-b4af528da294/ HTTP/1.1" 200 0
+WARNING 2025-08-29 03:38:07,291 log 327569 130429013522112 Not Found: /api/documents/e75df3b9-df84-40aa-8897-b4af528da294/
+WARNING 2025-08-29 03:38:07,292 basehttp 327569 130429013522112 "GET /api/documents/e75df3b9-df84-40aa-8897-b4af528da294/ HTTP/1.1" 404 1230
+INFO 2025-08-29 03:38:41,836 basehttp 327569 130429013522112 "POST /api/upload/ HTTP/1.1" 200 237
+INFO 2025-08-29 03:38:41,845 basehttp 327569 130428996736704 "OPTIONS /api/documents/36b34177-8659-4816-82e9-393680441c34/ HTTP/1.1" 200 0
+WARNING 2025-08-29 03:38:41,849 log 327569 130429013522112 Not Found: /api/documents/36b34177-8659-4816-82e9-393680441c34/
+WARNING 2025-08-29 03:38:41,849 basehttp 327569 130429013522112 "GET /api/documents/36b34177-8659-4816-82e9-393680441c34/ HTTP/1.1" 404 1233
+INFO 2025-08-29 03:39:29,766 autoreload 327569 130429063504000 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/views_simple.py changed, reloading.
+INFO 2025-08-29 03:39:30,171 autoreload 330058 138906672386176 Watching for file changes with StatReloader
+INFO 2025-08-29 03:39:43,596 autoreload 330058 138906672386176 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/urls.py changed, reloading.
+INFO 2025-08-29 03:39:43,931 autoreload 330185 129543009144960 Watching for file changes with StatReloader
+INFO 2025-08-29 03:40:02,592 basehttp 330185 129542959146688 "GET /api/documents/test-123/ HTTP/1.1" 200 286
+INFO 2025-08-29 03:42:20,193 basehttp 330185 129542959146688 "POST /api/upload/ HTTP/1.1" 200 238
+INFO 2025-08-29 03:42:20,531 basehttp 330185 129542941312704 "OPTIONS /api/documents/1a5c6a16-8b48-4025-a1ab-d289e7d12e28/ HTTP/1.1" 200 0
+INFO 2025-08-29 03:42:20,534 basehttp 330185 129542959146688 "GET /api/documents/1a5c6a16-8b48-4025-a1ab-d289e7d12e28/ HTTP/1.1" 200 314
+INFO 2025-08-29 04:01:43,768 basehttp 330185 129542949705408 "POST /api/upload/ HTTP/1.1" 200 237
+INFO 2025-08-29 04:01:44,100 basehttp 330185 129542959146688 "OPTIONS /api/documents/e53bb5cd-09b4-4c83-8468-3b10288723ab/ HTTP/1.1" 200 0
+INFO 2025-08-29 04:01:44,103 basehttp 330185 129542949705408 "GET /api/documents/e53bb5cd-09b4-4c83-8468-3b10288723ab/ HTTP/1.1" 200 314
+INFO 2025-08-29 04:03:10,308 autoreload 330185 129543009144960 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/views_simple.py changed, reloading.
+INFO 2025-08-29 04:03:10,911 autoreload 333500 133793158697088 Watching for file changes with StatReloader
+INFO 2025-08-29 04:03:51,261 autoreload 333500 133793158697088 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/views_simple.py changed, reloading.
+INFO 2025-08-29 04:03:51,623 autoreload 333862 124981541486720 Watching for file changes with StatReloader
+INFO 2025-08-29 04:03:56,967 autoreload 333862 124981541486720 /home/ostrich/workspace/github.com/dsledge1/Redact/backend/app/urls.py changed, reloading.
+INFO 2025-08-29 04:03:57,322 autoreload 333928 139204729467008 Watching for file changes with StatReloader
+INFO 2025-08-29 04:04:54,018 basehttp 333928 139204679468736 "GET /api/documents/test-123/download/ HTTP/1.1" 200 464
+INFO 2025-08-29 16:54:28,046 basehttp 333928 139204679468736 "OPTIONS /api/upload/ HTTP/1.1" 200 0
+INFO 2025-08-29 16:54:28,342 basehttp 333928 139204453463744 "POST /api/upload/ HTTP/1.1" 200 237
+INFO 2025-08-29 16:54:28,348 basehttp 333928 139204679468736 "OPTIONS /api/documents/ac799302-bf21-48e9-bce1-59f7f559dafb/ HTTP/1.1" 200 0
+INFO 2025-08-29 16:54:28,351 basehttp 333928 139204453463744 "GET /api/documents/ac799302-bf21-48e9-bce1-59f7f559dafb/ HTTP/1.1" 200 380
